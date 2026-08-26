@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<!-- pattern-tool 前端单页：原生 HTML/CSS/JS，无构建链（技术方案 7.1 前端选型）
+     主路径 = 上传 → 提交 → 拿图；裁剪为逐图可选增强，默认收起（1.2 节） -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>糯米纸图案自动化修图工具</title>
+  <link rel="stylesheet" href="vendor/cropper.min.css">
+  <style>
+    /* ---- 基础布局：移动优先（C 端主流在手机聊天内嵌浏览器） ---- */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #f5f6f8; color: #222; line-height: 1.6;
+      max-width: 760px; margin: 0 auto; padding: 16px 16px 96px;
+    }
+    header { text-align: center; padding: 12px 0 4px; }
+    header h1 { font-size: 22px; }
+    header p { font-size: 13px; color: #888; }
+
+    section { background: #fff; border-radius: 12px; padding: 16px; margin-top: 14px; box-shadow: 0 1px 4px rgba(0,0,0,.05); }
+    section h2 { font-size: 16px; margin-bottom: 10px; }
+
+    /* ---- 上传区 ---- */
+    #upload-drop-zone {
+      border: 2px dashed #c8ccd4; border-radius: 12px; padding: 28px 12px;
+      text-align: center; color: #888; cursor: pointer; transition: border-color .2s;
+    }
+    #upload-drop-zone.dragover { border-color: #3b82f6; background: #f0f6ff; }
+    #upload-drop-zone .main-hint { font-size: 15px; color: #333; }
+    #upload-drop-zone .sub-hint { font-size: 12px; margin-top: 4px; }
+
+    /* ---- 图片列表（上传预览 + 结果展示共用卡片结构） ---- */
+    .image-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-top: 12px; }
+    .image-card {
+      border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; background: #fafafa;
+      display: flex; flex-direction: column; position: relative;
+    }
+    .image-card .thumb-wrap { position: relative; width: 100%; aspect-ratio: 1; background: repeating-conic-gradient(#eee 0 25%, #fff 0 50%) 0 0/16px 16px; }
+    .image-card img.thumb { width: 100%; height: 100%; object-fit: contain; }
+    .image-card .card-info { padding: 8px; font-size: 12px; }
+    .image-card .seq-badge {
+      position: absolute; top: 6px; left: 6px; background: rgba(0,0,0,.55); color: #fff;
+      border-radius: 999px; font-size: 11px; padding: 1px 8px; z-index: 2;
+    }
+    .image-card .card-actions { display: flex; gap: 6px; padding: 0 8px 8px; flex-wrap: wrap; }
+    /* 步骤状态垂直排列（2026-08-26 21:54 需求：按执行顺序逐行显示） */
+    .image-card .stage-tags { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; margin-top: 2px; }
+    .tag { font-size: 11px; border-radius: 4px; padding: 0 6px; line-height: 20px; background: #eef1f5; color: #555; }
+    .tag.done { background: #e6f7ec; color: #1a7f37; }
+    .tag.skipped { background: #f1f2f4; color: #999; }
+    .tag.fallback { background: #fff4e5; color: #b25e09; }
+    .tag.hint-low-res, .tag.hint-heavy-watermark { background: #fdeaea; color: #c0392b; }
+
+    .status-text { font-size: 12px; color: #666; }
+    .status-text.processing { color: #2563eb; }
+    .status-text.completed { color: #1a7f37; }
+    .status-text.failed { color: #c0392b; }
+
+    /* ---- 按钮 ---- */
+    button {
+      border: none; border-radius: 8px; cursor: pointer; font-size: 13px;
+      padding: 6px 12px; background: #eef1f5; color: #333;
+    }
+    button.primary { background: #2563eb; color: #fff; font-size: 15px; padding: 10px 0; width: 100%; }
+    button.primary:disabled { background: #9db8e0; cursor: not-allowed; }
+    button.danger { color: #c0392b; }
+    button.ghost { background: #fff; border: 1px solid #d7dbe2; }
+
+    /* ---- 裁剪弹层 ---- */
+    #crop-modal {
+      position: fixed; inset: 0; background: rgba(0,0,0,.75); z-index: 100;
+      display: none; flex-direction: column; padding: 12px;
+    }
+    #crop-modal.active { display: flex; }
+    #crop-modal .crop-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: #fff; font-size: 14px; }
+    #crop-modal .crop-head select, #crop-modal .crop-head input[type=range] { flex: 0 1 auto; }
+    #crop-modal select { padding: 4px 8px; border-radius: 6px; border: none; font-size: 13px; }
+    .size-row { margin-top: 4px; }
+    .size-select { padding: 4px 8px; border-radius: 6px; border: 1px solid #e5e7eb; font-size: 12px; background: #fff; color: #555; max-width: 100%; }
+    #crop-stage { flex: 1; min-height: 0; margin-top: 10px; }
+    #crop-stage img { display: block; max-width: 100%; }
+    #crop-modal .crop-foot { display: flex; gap: 10px; margin-top: 10px; }
+    #crop-modal .crop-foot button { flex: 1; padding: 10px 0; font-size: 15px; }
+
+    /* 形状遮罩预览（叠在 cropper 裁剪框上；不拦截指针，拖拽交互仍走 cropper 手柄） */
+    .shape-overlay-canvas {
+      position: absolute; inset: 0; z-index: 2;
+      width: 100%; height: 100%;
+      pointer-events: none;
+    }
+
+    /* 形状模式：隐藏矩形裁剪框全部附件（边框/手柄/虚线/中线），只留形状遮罩。
+       矩形框只是 cropperjs 的载体，有效区域是内切形状——附件误导用户以为框角可选 */
+    .cropper-crop-box.shape-mode .cropper-view-box { outline: none !important; }
+    .cropper-crop-box.shape-mode .cropper-dashed,
+    .cropper-crop-box.shape-mode .cropper-center,
+    .cropper-crop-box.shape-mode .cropper-line,
+    .cropper-crop-box.shape-mode .cropper-point { display: none !important; }
+    /* 缩放锚点：右下角一个可见手柄（形状模式下唯一的尺寸调节入口） */
+    .cropper-crop-box.shape-mode .cropper-point.point-se {
+      display: block !important;
+      width: 10px; height: 10px; opacity: .7;
+    }
+
+    /* ---- 结果动作条 ---- */
+    .result-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+
+    /* ---- 结果图悬停放大浮层（桌面 hover 查看细节；触屏无 hover 不触发） ---- */
+    #result-zoom-layer {
+      position: fixed; z-index: 200; display: none;
+      pointer-events: none; /* 浮层不吃事件，鼠标操作不被打断 */
+      border: 1px solid #d7dbe2; border-radius: 8px; overflow: hidden;
+      box-shadow: 0 8px 30px rgba(0,0,0,.25);
+      /* 棋盘格底（2026-08-26 15:14 修复）：形状外透明区的真实显示——
+         纯白底会把 transparent 像素衬成"白"，误读为未透明 */
+      background: repeating-conic-gradient(#eee 0 25%, #fff 0 50%) 0 0/16px 16px;
+    }
+    #result-zoom-layer.active { display: block; }
+    #result-zoom-layer img { display: block; max-width: none; max-height: none; }
+    .image-card .thumb-wrap.zoomable { cursor: zoom-in; }
+    .result-actions a.download-link {
+      text-decoration: none; background: #2563eb; color: #fff; border-radius: 8px;
+      padding: 6px 12px; font-size: 13px; display: inline-block;
+    }
+
+    /* ---- 免责声明（页脚常驻，7 章合规红线） ---- */
+    footer { margin-top: 20px; font-size: 12px; color: #999; text-align: center; }
+    footer .disclaimer { text-align: left; background: #fff; border-radius: 10px; padding: 10px 12px; }
+
+    .mobile-hint { display: none; font-size: 12px; color: #2563eb; margin-top: 4px; }
+    @media (pointer: coarse) { .mobile-hint { display: block; } .desktop-only { display: none; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>糯米纸图案自动化修图工具</h1>
+    <p>上传 → 自动去水印 / 填充 / 裁剪 / 描边 / 变清晰 → 长按或下载保存成品</p>
+  </header>
+
+  <!-- 上传面板 -->
+  <section id="upload-panel">
+    <h2>1. 选择图片（1–9 张）</h2>
+    <div id="upload-drop-zone">
+      <div class="main-hint">点击选择 或 拖拽图片到这里</div>
+      <div class="sub-hint" id="upload-limits-hint">支持 PNG / JPG / WebP</div>
+      <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" multiple hidden>
+    </div>
+    <div class="image-list" id="upload-list"></div>
+    <div style="margin-top: 14px;">
+      <button class="primary" id="submit-button" disabled>开始处理</button>
+    </div>
+  </section>
+
+  <!-- 结果面板 -->
+  <section id="result-panel" style="display:none;">
+    <h2>2. 处理结果</h2>
+    <div id="batch-actions" style="display: none; margin-bottom: 10px; gap: 8px; flex-wrap: wrap;">
+      <button id="batch-download-button">批量下载</button>
+      <span id="batch-status" style="font-size: 12px; color: #888; line-height: 34px;"></span>
+    </div>
+    <div class="image-list" id="result-list"></div>
+    <div style="margin-top: 14px; display:flex; gap:10px;">
+      <button class="ghost" id="restart-button" style="flex:1;">再处理一批</button>
+    </div>
+  </section>
+
+  <!-- 裁剪弹层（逐图可选，默认收起） -->
+  <div id="crop-modal">
+    <div class="crop-head">
+      <span>形状：</span>
+      <select id="crop-shape-select">
+        <option value="rectangle" selected>自由矩形</option>
+        <option value="circle">圆形</option>
+        <option value="square">正方形</option>
+        <option value="rectangle-fixed">长方形</option>
+        <option value="heart">爱心</option>
+        <option value="star">星形</option>
+      </select>
+      <span id="crop-size-label" style="margin-left:auto; font-size:12px;"></span>
+    </div>
+    <div id="crop-stage"><img id="crop-source-image" alt="裁剪原图"></div>
+    <div class="crop-foot">
+      <button id="crop-cancel-button" class="ghost">取消</button>
+      <button id="crop-apply-button" style="background:#2563eb;color:#fff;">完成裁剪</button>
+    </div>
+  </div>
+
+  <!-- 结果图悬停放大浮层（跟随鼠标，桌面专用；触屏无 hover 自动不触发） -->
+  <div id="result-zoom-layer"><img alt="放大查看"></div>
+
+  <footer>
+    <div class="disclaimer" id="disclaimer-text">免责声明加载中…</div>
+    <p style="margin-top:8px;">图片 24 小时后自动删除</p>
+  </footer>
+
+  <script src="vendor/cropper.min.js"></script>
+    <script src="vendor/storezip.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

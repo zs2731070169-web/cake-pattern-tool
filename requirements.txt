@@ -1,0 +1,15 @@
+# 依赖清单
+fastapi==0.141.1
+# multipart 表单解析（FastAPI File/Form 的运行时必需件，随 fastapi 版本适配）
+python-multipart==0.0.20
+uvicorn[standard]==0.52.4
+pydantic==2.13.4
+pydantic-settings==2.15.0
+numpy==2.5.2
+opencv-python-headless==4.14.0.94
+pillow==12.3.0
+# 描边图案分割（u2netp 模型 4.5MB 首次运行自动下载入 ~/.rembg；离线部署需预下载）
+# 传递依赖 pooch/PyMatting/scikit-image/scipy/tqdm 由 pip 解析安装
+rembg==2.0.81
+httpx==0.28.1
+pytest==9.1.1
