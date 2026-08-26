@@ -1,0 +1,97 @@
+# 糯米纸图案自动化修图工具（pattern-tool）
+
+面向 C 端客户的自助修图 Web 工具：客户在浏览器上传蛋糕糯米纸图案 → 服务端自动
+去水印 / 背景填充 / 裁剪 / 描边 / 尺寸缩放 → 拿到可打印的透明 PNG 成品，直接发回
+聊天窗口。替代运营手动 PS 的重复性标准动作（每单 15+ 步 → 零步）。
+
+```
+上传 1-9 张图（可选逐图裁剪/选打印尺寸）→ 提交 → 自动修图 → 桌面端下载/复制，移动端长按存相册 → 发回聊天窗口
+```
+
+## 核心链路（五步管线，各步独立跳过）
+
+| 步骤 | 做什么 | 关键口径 |
+|---|---|---|
+| 去水印 | qwen-vl 语义预检判有无（~¥0.003/次）→ 有才调佐糖 PicWish 高级版修复 | 判无 skipped 零外呼；修复失败原图 + heavy-watermark 提示零误伤 |
+| 填充 | qwen-vl 判棋盘格背景 → qwen-image-2.0 生成式换纯白底 | 非棋盘格（白底/照片）skipped；结果缓存同图免重复计费 |
+| 裁剪 | 按前端声明（形状+框）运行时执行：框裁外接区 + 形状掩膜塑形（形状外 alpha=0） | 前端只声明不裁像素；默认矩形整图；同图切形状零重复外呼 |
+| 描边 | 白底判定 → rembg 图案分割 → 形状边界内缩灰线（1.5mm@300DPI 打印裁切参考线） | 非白底 skipped；rembg 不可用退灰度阈值法 |
+| 尺寸缩放 | 按打印尺寸档（4/6/8/10/12 寸 + 自定义 cm）缩放到 @300DPI 目标短边 | 缩小本地 INTER_AREA；放大优先佐糖 scale-pro 超分，失败插值兜底 |
+
+管线全程**原始域**处理（同图不同形状共享全部缓存与模型外呼）；棋盘格图自动换序
+先填充再去水印（避免去水印重绘格子致填充判定失效）。
+
+## 技术栈与架构
+
+- **后端**：Python 3.11/3.12 · FastAPI · uvicorn（worker=1，SQLite 单写者前提）· OpenCV · rembg
+- **存储**：SQLite（WAL，两表：`process_jobs` / `job_images`，DDL 在 `db/schema.sql` 启动自动执行）+ 本机文件系统（原图/结果 PNG，TTL 24h 自动清理）
+- **前端**：无构建链原生 HTML/CSS/JS 单页（cropper.js 裁剪交互），同进程静态挂载
+- **外部 API**：阿里云百炼（qwen-vl 判定 / qwen-image 换白）、佐糖 PicWish（去水印 / 超分）——全部可配置开关，未配 key 时对应步骤零误伤跳过
+
+```
+src/
+├── app/          # FastAPI 装配：main(工厂) / api(路由) / deps(依赖注入) / lifespan(单例生命周期)
+├── core/         # 基础设施：config(pydantic-settings) / database(SQLite 连接) /
+│                 # executor(线程池单例) / http(共享事件循环 HTTP 客户端)
+├── jobs/         # 批次编排：pipeline(五步管线+状态机) / store(两表读写) / ttl(过期清理+重启恢复)
+└── steps/        # 五个算法步：watermark / fill / crop / outline / resize(+imaging 编解码公共)
+web/              # 前端单页（index.html + app.js + vendor）
+db/schema.sql     # 建表 DDL（JobStore 初始化时读取执行，幂等）
+tests/            # pytest（API 校验 / 管线阶段 / 描边像素 / 填充生成 / TTL 恢复 / HTTP 线程模型）
+docs/plan/        # 技术方案文档（口径真源，改代码先改文档）
+```
+
+## 快速开始
+
+```bash
+# 1. 启动（自动建 .venv、装依赖、复制 .env 模板；会先清掉 data/ 旧数据并杀端口占用进程）
+./start.sh
+
+# 2. 打开 http://localhost:8200
+```
+
+需要 Python 3.11 或 3.12（3.13+ 的 opencv/rembg 轮子未验证）。
+
+其他命令：
+
+```bash
+./start.sh init    # 仅初始化/刷新依赖（requirements.txt 变更后）
+./start.sh check   # 环境自检，不安装不启动
+```
+
+> `start.sh` 的 `run` 分支每次启动会**清空 `data/`**（调试期防旧数据干扰）。
+> 生产部署保留数据（TTL 自动清理）时，注释掉脚本里的 `clear_runtime_data` 调用。
+
+## 配置（.env）
+
+复制 `.env.example` 为 `.env` 按需修改；优先级：真实环境变量 > `.env` > 代码默认值。
+常用项：
+
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `PT_PORT` | 监听端口 | 8200 |
+| `PT_DATA_DIR` | 数据根目录（库+图片+缓存） | data |
+| `PT_STEPS_ENABLED` | 启用的管线步骤（逗号分隔，单步调试用） | watermark,fill,crop,outline,resize |
+| `PT_WM_PRECHECK_KEY` / `PT_WM_API_KEY` | 百炼 VL 预检 / 佐糖去水印+超分 API Key | 空（未配则对应步跳过） |
+| `PT_FILL_GEN_KEY` | 百炼 qwen-image 换白底 Key | 空（未配则填充跳过） |
+| `PT_OUTLINE_WIDTH_MM` | 描边线宽（毫米） | 1.5 |
+| `PT_JOB_TTL_HOURS` | 批次保留时长 | 24 |
+
+密钥只经环境变量注入，绝不入库、不进前端与日志。全部变量见 `.env.example`（含逐项注释）。
+
+## 测试
+
+```bash
+.venv/bin/python -m pytest        # 全量（约 17s；无需外部 API key，外呼路径均有 mock/降级断言）
+```
+
+## 运维要点
+
+- **重启恢复**：启动时悬挂 `processing/queued` 图自动置 failed（话术"服务重启中断，请重新提交"），不留死状态
+- **TTL 清理**：每小时扫描，删过期批次文件、两表行与 API 结果缓存（24h 口径）
+- **限流**：同 IP 进行中批次 ≤ 9（429）；上传校验 PNG/JPG/WebP ≤ 15MB、单边 60–3600px、同批 SHA-256 查重
+- **日志**：去水印/填充链路 DEBUG 级打点（线上排障主径），不记图片内容
+
+## 文档
+
+- [`docs/plan/修图工具最小技术方案.md`](docs/plan/修图工具最小技术方案.md) — 模块技术设计唯一真源（需求口径、ER 图、接口契约、修订记录）；**改代码先改文档**

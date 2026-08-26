@@ -133,9 +133,13 @@ def segment_pattern_mask(
             session = _get_matting_session(settings.outline_matting_model)
             # 分析在白底合成副本上做（透明区的 BGR 残值不进模型）；结果交不透明区
             analysis_bgr = flatten_to_white(image_bgra)
+            module_logger.debug("outline matting: rembg session=%s", settings.outline_matting_model)
             rgba_result = remove(cv2.cvtColor(analysis_bgr, cv2.COLOR_BGR2RGB), session=session)
             alpha_mask = rgba_result[:, :, 3]
             binary = (alpha_mask >= settings.outline_matting_alpha_threshold).astype(np.uint8) * 255
+            module_logger.debug(
+                "outline matting: 图案掩膜占比=%.1f%%", float(np.mean(binary > 0)) * 100
+            )
             return binary * opaque
         except Exception as matting_error:  # 组件缺失/模型下载失败/推理异常 → 阈值法兜底
             module_logger.warning("outline matting failed, fallback to threshold: %s", matting_error)
@@ -396,7 +400,15 @@ class OutlineStep:
         """
         shape_value = crop_shape if crop_shape in KNOWN_CROP_SHAPES else "rectangle"
         image_bgra = ensure_bgra(image_ndarray)
-        if not shape_inner_band_is_white(image_bgra, shape_value, self._settings):
+        module_logger.info(
+            "outline start: shape=%s size=%dx%d", shape_value, image_bgra.shape[1], image_bgra.shape[0]
+        )
+        white_verdict = shape_inner_band_is_white(image_bgra, shape_value, self._settings)
+        if not white_verdict:
+            module_logger.info("outline → skipped (形状边带非白底)")
             return OutlineStepResult(image_ndarray, "skipped")
         outlined = draw_shape_outline(image_ndarray, shape_value, self._settings)
+        module_logger.info(
+            "outline → done: 线宽=%dpx 灰度=%d", outline_width_pixels(self._settings), self._settings.outline_gray_level
+        )
         return OutlineStepResult(outlined, "done")

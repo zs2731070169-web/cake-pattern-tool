@@ -40,7 +40,6 @@
   var uploadList = document.getElementById('upload-list');
   var submitButton = document.getElementById('submit-button');
   var resultList = document.getElementById('result-list');
-  var resultPanel = document.getElementById('result-panel');
   var restartButton = document.getElementById('restart-button');
   var cropModal = document.getElementById('crop-modal');
   var cropShapeSelect = document.getElementById('crop-shape-select');
@@ -168,9 +167,15 @@
       });
       var customOption = document.createElement('option');
       customOption.value = 'custom';
-      customOption.textContent = '自定义 (cm)';
+      // 有自定义值时选项文字带上数值（2026-08-27 空白 bug 修复配套：
+      // 非档位值选中 custom 项，文字显示实际尺寸）
+      var isCustomValue = item.sizeCm && !SIZE_OPTIONS.some(function (opt) { return String(opt.cm) === String(item.sizeCm); });
+      customOption.textContent = isCustomValue ? '自定义：' + item.sizeCm + 'cm' : '自定义 (cm)';
       sizeSelect.appendChild(customOption);
-      sizeSelect.value = item.sizeCm ? String(item.sizeCm) : '';
+      // 选中值（2026-08-27 修复）：非档位值赋 String(sizeCm) 时 select 找不到
+      // 对应 option → value 归空、显示空白（统一尺寸设 32 后逐图全白的根因）
+      // ——档位值选档位项，非档位值（含自定义）一律落 custom 项
+      sizeSelect.value = isCustomValue ? 'custom' : (item.sizeCm ? String(item.sizeCm) : '');
       sizeSelect.addEventListener('change', function () {
         if (sizeSelect.value === 'custom') {
           var input = window.prompt('输入打印尺寸（厘米，5-100）', item.sizeCm || '15');
@@ -283,6 +288,95 @@
     uploadDropZone.classList.remove('dragover');
     acceptFiles(event.dataTransfer.files);
   });
+
+  // ---- 统一尺寸批量设置（2026-08-27 第七次修订；同日改自绘下拉）----
+  // 同批多图打印尺寸相同时一键写入 item.sizeCm，免逐张下拉；选"清除"恢复
+  // 各图独立（null）。逐图下拉仍可后续单独覆盖——批量只写值不锁编辑。
+  // 自绘原因：原生 select 选项永远浮层遮挡内容（浏览器行为不可改），用户
+  // 要求选项从选择器下方滑出并推开内容——文档流展开 + max-height 过渡实现。
+  var batchDropdown = document.getElementById('batch-size-dropdown');
+  var batchTrigger = document.getElementById('batch-size-trigger');
+  var batchMenu = document.getElementById('batch-size-menu');
+  var BATCH_OPTIONS = [{ value: '', label: '不设置' }]
+    .concat(SIZE_OPTIONS.map(function (opt) { return { value: String(opt.cm), label: '全部: ' + opt.label }; }))
+    .concat([{ value: 'custom', label: '全部: 自定义 (cm)' }]);
+  // "清除"选项已撤（2026-08-27 用户定案：与"不设置"语义重复）
+
+  function setBatchTriggerLabel(label) {
+    batchTrigger.textContent = label;
+  }
+
+  function closeBatchDropdown() {
+    batchDropdown.classList.remove('open');
+  }
+
+  (function initBatchMenu() {
+    BATCH_OPTIONS.forEach(function (opt) {
+      var optionElement = document.createElement('div');
+      optionElement.className = 'menu-option' + (opt.value === '' ? ' selected' : '');
+      optionElement.textContent = opt.label;
+      optionElement.dataset.value = opt.value;
+      optionElement.addEventListener('click', function () {
+        // 选中态迁移
+        Array.prototype.forEach.call(batchMenu.children, function (c) { c.classList.remove('selected'); });
+        optionElement.classList.add('selected');
+        closeBatchDropdown();
+        applyBatchSize(opt.value, opt.label);
+      });
+      batchMenu.appendChild(optionElement);
+    });
+  })();
+
+  batchTrigger.addEventListener('click', function (event) {
+    event.stopPropagation();
+    batchDropdown.classList.toggle('open');
+  });
+  document.addEventListener('click', function (event) {
+    if (batchDropdown.classList.contains('open') && !batchDropdown.contains(event.target)) {
+      closeBatchDropdown();
+    }
+  });
+
+  // 提交后复位（trigger 文案 + 选中态回"不设置"；图片列表已清无需重渲）
+  function resetBatchSizeSelection() {
+    setBatchTriggerLabel('不设置');
+    Array.prototype.forEach.call(batchMenu.children, function (c) {
+      c.classList.toggle('selected', c.dataset.value === '');
+    });
+  }
+
+  function applyBatchSize(value, label) {
+    // ''（不设置）：全部恢复各图独立（2026-08-27 修复——旧代码对 '' 直接
+    // return，选回"不设置"后每张图仍停留原尺寸）
+    if (value === '') {
+      pendingImages.forEach(function (item) { item.sizeCm = null; });
+      setBatchTriggerLabel('不设置');
+      renderUploadList();
+      return;
+    }
+    var sizeCm;
+    if (value === 'custom') {
+      var input = window.prompt('输入统一打印尺寸（厘米，5-100）', '15');
+      var parsed = parseFloat(input);
+      if (input != null && !isNaN(parsed) && parsed >= 5 && parsed <= 100) {
+        sizeCm = parsed;
+        setBatchTriggerLabel('全部: ' + parsed + 'cm');
+      } else {
+        if (input != null) window.alert('请输入 5-100 之间的数字');
+        // 取消输入：回退选中态到"不设置"
+        Array.prototype.forEach.call(batchMenu.children, function (c) {
+          c.classList.toggle('selected', c.dataset.value === '');
+        });
+        setBatchTriggerLabel('不设置');
+        return;
+      }
+    } else {
+      sizeCm = parseFloat(value);
+      setBatchTriggerLabel(label);
+    }
+    pendingImages.forEach(function (item) { item.sizeCm = sizeCm; });
+    renderUploadList(); // 逐图下拉同步显示新值
+  }
 
   // ---- 裁剪交互（cropperjs 1.x API；形状=宽高比约束 + crop 后遮罩塑形） ----
 
@@ -413,6 +507,28 @@
 
   cropShapeSelect.addEventListener('change', startCropper);
   cropCancelButton.addEventListener('click', closeCropModal);
+
+  // 桌面肌肉记忆（2026-08-27）：ESC 关弹层；点遮罩空白处关闭（点在图/头部/
+  // 底部控件上不关——裁剪操作区误触代价高）
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && cropModal.classList.contains('active')) closeCropModal();
+  });
+  cropModal.addEventListener('click', function (event) {
+    if (event.target === cropModal || event.target.id === 'crop-stage') closeCropModal();
+  });
+
+  // Ctrl+V 粘贴上传（2026-08-27 桌面端：聊天窗口收图→直接粘贴，省"先存盘"）
+  document.addEventListener('paste', function (event) {
+    if (cropModal.classList.contains('active')) return; // 裁剪中不抢粘贴
+    var pastedFiles = event.clipboardData && event.clipboardData.files;
+    if (!pastedFiles || !pastedFiles.length) return;
+    var imageFiles = Array.prototype.filter.call(pastedFiles, function (f) {
+      return f.type.indexOf('image/') === 0;
+    });
+    if (!imageFiles.length) return;
+    event.preventDefault();
+    acceptFiles(imageFiles);
+  });
 
   function closeCropModal() {
     destroyCropper();
@@ -568,7 +684,10 @@
       });
       pendingImages = [];
       renderUploadList();
-      resultPanel.style.display = '';
+      // 提交后统一尺寸回"不设置"（2026-08-27 用户定案：批量值只作用于本批，
+      // 下一批从零开始——trigger 文案与选中态一并复位）
+      resetBatchSizeSelection();
+      // 双栏同屏（2026-08-27 第六次修订）：右栏常驻无需显隐切换与滚动跟随
       resultList.innerHTML = '<div class="status-text processing">处理中，请稍候…</div>';
       startPolling();
     } catch (submitError) {
@@ -604,25 +723,51 @@
     } catch (networkError) { /* 网络抖动下轮重试 */ }
   }
 
+  // ---- 顶部小弹窗 toast（2026-08-27：按钮反馈统一入口） ----
+  var toastLayer = document.getElementById('toast-layer');
+  function showToast(message, isError) {
+    if (!toastLayer) return;
+    var toastItem = document.createElement('div');
+    toastItem.className = 'toast-item' + (isError ? ' toast-error' : '');
+    toastItem.textContent = message;
+    toastLayer.appendChild(toastItem);
+    requestAnimationFrame(function () { toastItem.classList.add('show'); });
+    setTimeout(function () {
+      toastItem.classList.remove('show');
+      setTimeout(function () { if (toastItem.parentNode) toastItem.parentNode.removeChild(toastItem); }, 300);
+    }, 2200);
+  }
+
   // ---- 结果渲染与分端交付 ----
 
   // 全部执行步骤展示（2026-08-26 补裁剪/缩放）；crop 记档是声明 JSON 特判
   // 执行顺序（垂直排列）：去水印→填充→裁剪→描边→分辨率（2026-08-26 21:54
   // 补 resize 格；值=实际分辨率，异步从结果图回填，回填前显示状态词）
-  var STAGE_LABELS = { watermark: '去水印', fill: '填充', crop: '裁剪', outline: '描边', resize: '分辨率' };
+  var STAGE_LABELS = {watermark: '去水印', fill: '填充', crop: '裁剪', outline: '描边', resize: '分辨率'};
   var STAGE_VALUE_LABELS = { 'done': '已处理', 'skipped': '跳过', 'fallback': '保留原样', 'done(api)': 'AI处理', 'done(degraded)': 'AI降级', '白色背景': '白底替换', 'done(upscaled)': '已自动提升' };
   var SHAPE_CN = { circle: '圆形', square: '正方形', rectangle: '自由矩形', 'rectangle-fixed': '长方形', heart: '爱心', star: '星形', free: '自由矩形' };
-  // low-res 提示已撤（2026-08-26 16:22 定案：低清图自动变清晰提升，不再提醒换图）
-  var HINT_LABELS = { 'heavy-watermark': '水印较复杂，建议人工复核' };
+  // quality_hint 提示已全线撤销（2026-08-27 用户定案：heavy-watermark 提示
+  // 也不再显示——结果卡只保留步骤标签，无警示标签）；HINT_LABELS 保留空表
+  // 供字段兼容，渲染处空值直接跳过
+  var HINT_LABELS = {};
 
   var batchDownloadButton = document.getElementById('batch-download-button');
+  var batchDeleteButton = document.getElementById('batch-delete-button');
   var batchStatus = document.getElementById('batch-status');
   var batchResultUrls = []; // 当前批次的 completed 结果 URL 序列（批量动作用）
 
+  // 会话级删除（2026-08-27 终版：去掉逐卡勾选框，标题行"全部删除"+确认弹窗）：
+  // removedImageIds 过滤渲染与批量动作——只整理视图不调后端（结果文件由 24h
+  // TTL 统一清理）；删除前 confirm 友好提示，确认才删
+  var latestJobStatus = null;
+  var removedImageIds = {};
+
   function renderResults(jobStatus) {
+    latestJobStatus = jobStatus;
     resultList.innerHTML = '';
     batchResultUrls = [];
     jobStatus.images.forEach(function (imageStatus) {
+      if (removedImageIds[imageStatus.image_id]) return; // 已删不渲染
       resultList.appendChild(buildResultCard(imageStatus));
       if (imageStatus.status === 'completed' && imageStatus.result_url) {
         batchResultUrls.push({ seq: imageStatus.seq, url: imageStatus.result_url });
@@ -631,18 +776,46 @@
     updateBatchActions();
   }
 
+  function removeImages(imageIds) {
+    imageIds.forEach(function (id) { removedImageIds[id] = true; });
+    if (latestJobStatus) renderResults(latestJobStatus);
+    if (!resultList.children.length) showResultPlaceholder(); // 全删完回引导态
+  }
+
+  function updateDeleteButtonState() {
+    if (!batchDeleteButton) return;
+    // "全部删除"（2026-08-27 终版）：有结果即可用，无结果禁用
+    batchDeleteButton.disabled = batchResultUrls.length === 0;
+    batchDeleteButton.textContent = '全部删除';
+  }
+
+  if (batchDeleteButton) {
+    batchDeleteButton.addEventListener('click', function () {
+      if (!batchResultUrls.length) return;
+      // 友好确认弹窗（2026-08-27 用户定案文案）：确认才删，取消不动
+      var confirmed = window.confirm('删除之后不可再次取回，请确保已经保存后再删除');
+      if (!confirmed) return;
+      var toRemove = Object.keys(removedImageIds).length; // 仅用于计数反馈
+      var allIds = [];
+      latestJobStatus.images.forEach(function (imageStatus) {
+        if (!removedImageIds[imageStatus.image_id]) allIds.push(imageStatus.image_id);
+      });
+      removeImages(allIds);
+      showToast('已删除 ' + allIds.length + ' 张');
+    });
+  }
+
   function updateBatchActions() {
-    var batchContainer = document.getElementById('batch-actions');
-    var multi = batchResultUrls.length >= 1;
-    batchContainer.style.display = multi ? 'flex' : 'none';
-    // 多张时的主路径引导（2026-08-27）：批量复制已撤（剪贴板一次只能持
-    // 1 张图，逐张倒计时体验鸡肋）——"一次发多张"走文件级路径：ZIP 下载
-    // → 解压 → 全选拖入聊天窗口（聊天端多文件一次接收）
-    if (batchStatus) {
-      batchStatus.textContent = batchResultUrls.length >= 2
-        ? '多张一次发窗口：批量下载 → 解压 → 全选拖入聊天窗口'
-        : '';
+    // 标题行"下载/全部删除"（2026-08-27 终版）：有结果即可用
+    if (batchDownloadButton) {
+      batchDownloadButton.disabled = batchResultUrls.length === 0;
     }
+    var batchContainer = document.getElementById('batch-actions');
+    batchContainer.style.display = 'none';
+    if (batchStatus) {
+      batchStatus.textContent = '';
+    }
+    updateDeleteButtonState();
   }
 
   // 批量下载：ZIP 打包单文件落盘（2026-08-26 16:55 改版——旧逐张 a[download]
@@ -680,6 +853,8 @@
     var card = document.createElement('div');
     card.className = 'image-card';
     var resizeTagToFill = null; // 分辨率格：加载完回填实际像素
+
+    // 勾选框已撤（2026-08-27 终版：批量删除改为标题行"全部删除"+确认弹窗）
 
     var thumbWrap = document.createElement('div');
     thumbWrap.className = 'thumb-wrap';
@@ -730,24 +905,30 @@
             tag.textContent = '裁剪:' + (SHAPE_CN[shapeName] || shapeName) + (applied ? '' : '(默认)');
           }
         } else {
+          // 执行失败红显（2026-08-27 用户定案）："该跑但没跑成"与"不用跑"分开——
+          // failed（去水印检出但佐糖失败 / 填充触发但生成失败）、done(interpolated)
+          // （超分失败走插值）一律红底"执行失败"；skipped=真没执行（无水印/
+          // 非棋盘格）保持灰显"跳过"
+          var isFailed = stageValue === 'failed' || stageValue === 'done(interpolated)';
           var normalizedValue = stageValue === 'done' ? 'done' : (stageValue === 'skipped' ? 'skipped' : (stageValue === 'fallback' ? 'fallback' : 'done'));
+          if (isFailed) normalizedValue = 'failed';
           tag.className = 'tag ' + normalizedValue;
-          tag.textContent = STAGE_LABELS[stageKey] + ':' + (STAGE_VALUE_LABELS[stageValue] || stageValue);
+          tag.textContent = STAGE_LABELS[stageKey] + ':' + (isFailed ? '执行失败' : (STAGE_VALUE_LABELS[stageValue] || stageValue));
           if (stageKey === 'resize' && stageValue !== 'skipped') {
             // 值=实际分辨率：等缩略图加载完读 naturalWidth×Height 回填（图是同一张）
-            resizeTagToFill = tag;
+            if (isFailed) {
+              // 执行失败：保留失败文案，不回填分辨率数字（分辨率虽真但语义误导）
+              resizeTagToFill = null;
+            } else {
+              resizeTagToFill = tag;
+            }
           }
         }
         stageTags.appendChild(tag);
       });
       info.appendChild(stageTags);
 
-      if (imageStatus.quality_hint && imageStatus.quality_hint !== 'none') {
-        var hintTag = document.createElement('span');
-        hintTag.className = 'tag hint-' + imageStatus.quality_hint;
-        hintTag.textContent = HINT_LABELS[imageStatus.quality_hint] || imageStatus.quality_hint;
-        info.appendChild(hintTag);
-      }
+      // quality_hint 警示标签渲染已撤（2026-08-27 用户定案：提示完全去掉）
 
       var resultImage = document.createElement('img');
       resultImage.className = 'thumb';
@@ -761,60 +942,51 @@
       thumbWrap.appendChild(resultImage);
       attachResultZoom(thumbWrap, imageStatus.result_url);
 
-      // 分端交付动作（10b：特性检测降级，基础动作不阻塞）
+      // 卡片底部动作条（2026-08-27 终版：每张卡保留下载/复制/删除三个独立
+      // 按钮；标题行页面级"下载/删除"是批量语义，两级并存各司其职）
       var actions = document.createElement('div');
       actions.className = 'result-actions';
       actions.style.padding = '8px';
-
+      var downloadLink = document.createElement('a');
+      downloadLink.className = 'download-link';
+      downloadLink.href = imageStatus.result_url;
+      downloadLink.download = 'pattern_' + imageStatus.seq + '.png';
+      downloadLink.textContent = '下载';
+      downloadLink.addEventListener('click', function () {
+        showToast('已开始下载 pattern_' + imageStatus.seq + '.png');
+      });
+      actions.appendChild(downloadLink);
+      if (navigator.clipboard && window.ClipboardItem) {
+        var copyButton = document.createElement('button');
+        copyButton.textContent = '复制';
+        copyButton.addEventListener('click', async function () {
+          try {
+            var clipboardResponse = await fetch(imageStatus.result_url);
+            var clipboardBlob = await clipboardResponse.blob();
+            await navigator.clipboard.write([new ClipboardItem({ 'image/png': clipboardBlob })]);
+            showToast('已复制到剪贴板');
+          } catch (clipboardError) {
+            showToast('复制失败', true);
+          }
+        });
+        actions.appendChild(copyButton);
+      }
+      var singleDeleteButton = document.createElement('button');
+      singleDeleteButton.className = 'danger';
+      singleDeleteButton.textContent = '删除';
+      singleDeleteButton.addEventListener('click', function () {
+        removeImages([imageStatus.image_id]);
+        showToast('已删除 1 张（第 ' + imageStatus.seq + ' 张）');
+      });
+      actions.appendChild(singleDeleteButton);
       if (isMobileEnvironment()) {
-        // 移动端主路径：内联展示 + 长按存相册（系统能力，无需按钮）
         var longPressHint = document.createElement('div');
         longPressHint.className = 'mobile-hint';
         longPressHint.textContent = '长按上方图片保存到相册';
         actions.appendChild(longPressHint);
-        if (navigator.share) {
-          var shareButton = document.createElement('button');
-          shareButton.textContent = '分享';
-          shareButton.addEventListener('click', async function () {
-            try {
-              var imageResponse = await fetch(imageStatus.result_url);
-              var imageBlob = await imageResponse.blob();
-              var shareFile = new File([imageBlob], 'pattern.png', { type: 'image/png' });
-              if (navigator.canShare && navigator.canShare({ files: [shareFile] })) {
-                await navigator.share({ files: [shareFile], title: '修图结果' });
-              } else {
-                await navigator.share({ title: '修图结果', url: location.origin + imageStatus.result_url });
-              }
-            } catch (shareError) { /* 用户取消等：静默 */ }
-          });
-          actions.appendChild(shareButton);
-        }
-      } else {
-        // 桌面端主路径：下载落默认目录
-        var downloadLink = document.createElement('a');
-        downloadLink.className = 'download-link';
-        downloadLink.href = imageStatus.result_url;
-        downloadLink.download = 'pattern_' + imageStatus.seq + '.png';
-        downloadLink.textContent = '下载';
-        actions.appendChild(downloadLink);
-        if (navigator.clipboard && window.ClipboardItem) {
-          var copyButton = document.createElement('button');
-          copyButton.textContent = '复制图片';
-          copyButton.addEventListener('click', async function () {
-            try {
-              var clipboardResponse = await fetch(imageStatus.result_url);
-              var clipboardBlob = await clipboardResponse.blob();
-              await navigator.clipboard.write([new ClipboardItem({ 'image/png': clipboardBlob })]);
-              copyButton.textContent = '已复制';
-            } catch (clipboardError) {
-              copyButton.textContent = '复制失败';
-            }
-          });
-          actions.appendChild(copyButton);
-        }
       }
-      card.appendChild(info);
       card.appendChild(actions);
+      card.appendChild(info);
     } else {
       card.appendChild(info);
     }
@@ -826,28 +998,43 @@
   restartButton.addEventListener('click', function () {
     stopPolling();
     submittingJobId = null;
-    resultPanel.style.display = 'none';
+    showResultPlaceholder(); // 双栏常驻：回引导态而非隐藏
     hideResultZoom();
-    window.scrollTo({ top: 0, behavior: 'smooth' });
   });
 
   // ---- 结果图悬停放大（桌面 hover 查看细节；触屏无 hover 不触发，pointer-events:none 不打断点击/长按） ----
 
   var resultZoomLayer = document.getElementById('result-zoom-layer');
   var resultZoomImage = resultZoomLayer ? resultZoomLayer.querySelector('img') : null;
-  var ZOOM_VIEW_MAX = 480; // 浮层最大边（px），避免大图铺满屏
+  var ZOOM_VIEW_MAX = 800; // 浮层最大边（px）——2026-08-27 桌面端 480→800：缩略图可辨修图质量
   var ZOOM_VIEW_MARGIN = 16; // 距视口边距
 
+  // 悬停放大（2026-08-27 定案：立即放大——勾选框已移出缩略图到信息栏，
+  // 冲突源消失，延迟门槛（曾 150ms→1.5s→800ms）全线撤销，mouseenter 即出图）
   function attachResultZoom(thumbWrap, imageUrl) {
     if (!resultZoomLayer || !resultZoomImage) return;
     thumbWrap.classList.add('zoomable');
+    // 悬停放大角标（2026-08-27：hover 浮层此前无入口提示，不可发现）
+    var zoomHint = document.createElement('span');
+    zoomHint.className = 'zoom-hint';
+    zoomHint.textContent = '悬停放大';
+    thumbWrap.appendChild(zoomHint);
+    // 200ms 延迟（2026-08-27 定案：无延迟版鼠标扫过即闪图太吵——短门槛
+    // 滤掉扫过/点按钮的路径，真停留立即跟上；离开即取消计时）
+    var hoverTimer = null;
     thumbWrap.addEventListener('mouseenter', function () {
-      if (resultZoomImage.getAttribute('src') !== imageUrl) resultZoomImage.src = imageUrl;
-      resultZoomLayer.classList.add('active');
-      positionResultZoom();
+      clearTimeout(hoverTimer);
+      hoverTimer = setTimeout(function () {
+        if (resultZoomImage.getAttribute('src') !== imageUrl) resultZoomImage.src = imageUrl;
+        resultZoomLayer.classList.add('active');
+        positionResultZoom();
+      }, 200);
     });
     thumbWrap.addEventListener('mousemove', positionResultZoom);
-    thumbWrap.addEventListener('mouseleave', hideResultZoom);
+    thumbWrap.addEventListener('mouseleave', function () {
+      clearTimeout(hoverTimer);
+      hideResultZoom();
+    });
   }
 
   function positionResultZoom(event) {
@@ -885,13 +1072,24 @@
       var response = await fetch('/api/meta');
       if (!response.ok) return;
       var meta = await response.json();
-      document.getElementById('disclaimer-text').textContent = meta.disclaimer + (meta.remote_api_disclaimer || '');
+      var disclaimerElement = document.getElementById('disclaimer-text');
+      // ttl-hint 子元素是常驻行（24h 删除），textContent 赋值会冲掉——先摘再挂
+      var ttlHint = disclaimerElement.querySelector('.ttl-hint');
+      disclaimerElement.textContent = meta.disclaimer + (meta.remote_api_disclaimer || '');
+      if (ttlHint) disclaimerElement.appendChild(ttlHint);
       document.getElementById('upload-limits-hint').textContent =
         '支持 PNG / JPG / WebP · 最多 ' + meta.max_images + ' 张 · 单张 ≤ ' + meta.max_image_mb + 'MB'
         + (meta.min_image_pixels ? ' · 最小边 ≥ ' + meta.min_image_pixels + 'px' : '')
         + (meta.reject_duplicate_images ? ' · 请勿重复上传相同图片' : '');
     } catch (metaError) { /* 兜底文案已写死在 HTML */ }
   }
+
+  // 右栏常驻初始态（2026-08-27 双栏：未提交时引导文案占位，不再隐藏面板）
+  function showResultPlaceholder() {
+    resultList.innerHTML = '<div class="status-text" style="padding:32px 12px;text-align:center;color:#b0b0b0;">'
+      + '处理结果将显示在这里<br>左侧选择图片 → 点击「开始处理」</div>';
+  }
+  showResultPlaceholder();
 
   loadMeta();
 })();

@@ -220,7 +220,7 @@ def test_gen_full_subject_single_color_outcalls_once(tmp_path, monkeypatch):
     canvas = _checkerboard_canvas()
     canvas[:, :, :] = (60, 200, 60)  # 主体铺满全图（纯色）
     result = FillStep(_gen_settings(tmp_path)).run(canvas)
-    assert result.stage_value in ("done(degraded)", "skipped")  # stub 返回 None → 降级
+    assert result.stage_value == "failed"  # stub 返回 None → 降级（2026-08-27 记档口径：触发但失败=failed，前端红显）
 
 
 # ---- 降级链 ----
@@ -233,7 +233,7 @@ def test_gen_api_error_degrades(tmp_path, monkeypatch):
     _install_checkerboard_stub(monkeypatch, True)
     result = FillStep(_gen_settings(tmp_path)).run(_checkerboard_canvas())
     assert stub.calls == 1
-    assert result.stage_value in ("done(degraded)", "skipped")
+    assert result.stage_value == "failed"  # 2026-08-27 记档口径：触发但失败=failed
 
 
 def test_gen_paper_white_delivered_verbatim(tmp_path, monkeypatch):
@@ -441,7 +441,8 @@ def test_resize_upscale_prefers_super_resolution(tmp_path, monkeypatch):
 
 
 def test_resize_upscale_fallback_interpolation(tmp_path, monkeypatch):
-    """佐糖失败 → Lanczos 插值降级保交付（low-res 已撤 2026-08-27：不提示）。"""
+    """佐糖失败 → Lanczos 插值降级保交付；记档 done(interpolated)
+    （2026-08-27 定案：前端分辨率格红显"执行失败"——降级对客户可见）。"""
     from src.steps.resize import ResizeStep, picwish_scale
 
     settings = _gen_settings(tmp_path)
@@ -454,19 +455,20 @@ def test_resize_upscale_fallback_interpolation(tmp_path, monkeypatch):
 
     canvas = np.full((500, 500, 3), 250, np.uint8)
     result = ResizeStep(settings).run(canvas, 29.0)
-    assert result.stage_value == "done"
+    assert result.stage_value == "done(interpolated)"
     assert min(result.image_bgr.shape[:2]) == 3425
     assert result.quality_hint == "none"
 
 
 def test_resize_upscale_not_configured_interpolation(tmp_path):
-    """佐糖未配置（默认 _gen_settings 无 key）→ 直接插值（不提示）。"""
+    """佐糖未配置（默认 _gen_settings 无 key）→ 直接插值；
+    记档 done(interpolated)（同失败口径——超分没跑就是没跑）。"""
     from src.steps.resize import ResizeStep
 
     settings = _gen_settings(tmp_path)
     assert not settings.wm_api_enabled  # 前置：该夹具本就未配置佐糖
     canvas = np.full((500, 500, 3), 250, np.uint8)
     result = ResizeStep(settings).run(canvas, 29.0)
-    assert result.stage_value == "done"
+    assert result.stage_value == "done(interpolated)"
     assert min(result.image_bgr.shape[:2]) == 3425
     assert result.quality_hint == "none"

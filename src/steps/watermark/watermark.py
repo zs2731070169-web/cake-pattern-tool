@@ -77,15 +77,19 @@ class WatermarkStep:
         analysis_bgr = flatten_to_white(ensure_bgra(working_bgr))
 
         # ---- qwen-vl 为唯一检测器（4.4 v5，2026-08-25）----
+        module_logger.info(
+            "watermark start: size=%dx%d 域=%s", analysis_bgr.shape[1], analysis_bgr.shape[0],
+            "原始" if original_bgr is not None else "裁剪版",
+        )
         module_logger.debug("precheck configured=%s", self._precheck.is_configured())
         if not self._precheck.is_configured():
             return WatermarkStepResult(image_ndarray, "skipped")
         precheck_verdict = self._precheck.has_watermark(analysis_bgr)
-        module_logger.debug("precheck verdict=%s", precheck_verdict)
+        module_logger.info("watermark: VL 预检判定=%s", {True: "有水印", False: "无水印", None: "预检失败(按无水印)"}[precheck_verdict])
         is_heavy = False  # heavy 判定依赖 OpenCV mask（已退役），语义档无需此标记
 
         if precheck_verdict is not True:
-            module_logger.debug("no watermark signal → skipped")
+            module_logger.info("watermark → skipped（无水印信号，零外呼）")
             return WatermarkStepResult(image_ndarray, "skipped")
 
         # ---- 修复：缓存优先（原始域键），主力 qwen-image，佐糖兜底 ----
@@ -99,16 +103,22 @@ class WatermarkStep:
         # 修复：佐糖 PicWish 高级版（2026-08-26 回退恢复主力）
         module_logger.debug("picwish configured=%s", self._picwish.is_configured())
         if self._picwish.is_configured():
+            module_logger.info("watermark: 检出水印 → 佐糖修复外呼中…")
             repaired = self._picwish.remove_watermark(analysis_bgr)
-            module_logger.debug("picwish result=%s", "ok" if repaired is not None else "failed")
+            module_logger.info(
+                "watermark: 佐糖修复%s", "成功" if repaired is not None else "失败（欠费/超时——原样交付记 failed）"
+            )
+        else:
+            module_logger.warning("watermark: 检出水印但佐糖未配置 → failed 原样交付")
 
         if repaired is not None:
             self._cache.put(analysis_bgr, repaired)
             repaired_cropped = self._map_to_cropped(repaired, image_bgra, crop_meta_json)
             return self._merge_repaired_result(image_bgra, repaired_cropped, "done(api)", "none", is_heavy)
 
-        # 修复失败：原样零误伤（检出水印时仍提示客户）
-        return WatermarkStepResult(image_ndarray, "skipped", "heavy-watermark", is_heavy)
+        # 修复失败（欠费/超时等）：原样零误伤交付，记档 failed（2026-08-27
+        # 定案——"该修但没修成"与"根本没水印"分开，前端红显"执行失败"）
+        return WatermarkStepResult(image_ndarray, "failed", "heavy-watermark", is_heavy)
 
     @staticmethod
     def _map_to_cropped(

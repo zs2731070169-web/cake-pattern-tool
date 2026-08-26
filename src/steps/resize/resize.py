@@ -69,9 +69,10 @@ class ResizeStep:
         image_bgra = ensure_bgra(image_ndarray)
         short_side = min(image_bgra.shape[:2])
         target = target_short_side_pixels(float(size_cm), self._settings.print_dpi)
-        module_logger.debug(
-            "resize: short=%d target=%d (%.0fcm@%dDPI)",
-            short_side, target, float(size_cm), self._settings.print_dpi,
+        module_logger.info(
+            "resize start: %.0fcm@%dDPI 短边=%d→%d（%s）",
+            float(size_cm), self._settings.print_dpi, short_side, target,
+            "放大" if short_side < target else "缩小",
         )
 
         if short_side == target:
@@ -92,8 +93,11 @@ class ResizeStep:
         # 糊到不可用是更硬的痛点（299px 选 12 寸=19 倍），用户实测效果达标）：
         # 优先佐糖 scale-pro 超分，结果仍小于目标再 Lanczos 补尾程；佐糖
         # 失败/未配置降级纯插值保交付（不再提示 low-res——2026-08-27 撤）。
+        # 降级记档口径（2026-08-27 定案）：超分失败（欠费/超时等）记
+        # done(interpolated)——前端分辨率格红显"执行失败"，客户可见降级真相。
         upscaled_bgra = self._try_super_resolution(image_bgra)
         base_for_further = upscaled_bgra if upscaled_bgra is not None else image_bgra
+        stage_value = "done" if upscaled_bgra is not None else "done(interpolated)"
         scale = target / min(base_for_further.shape[:2])
         resized = base_for_further if scale == 1 else cv2.resize(
             base_for_further,
@@ -115,7 +119,7 @@ class ResizeStep:
             resized[:, :, 3] = np.where(shape_mask, np.maximum(soft, 128), np.minimum(soft, 127))
             module_logger.debug("resize: shape mask repainted at %dx%d", resized.shape[1], resized.shape[0])
         module_logger.debug("resize: upscale → %dx%d", resized.shape[1], resized.shape[0])
-        return ResizeStepResult(resized, "done", quality_hint="none")
+        return ResizeStepResult(resized, stage_value, quality_hint="none")
 
     def _try_super_resolution(self, image_bgra: np.ndarray) -> np.ndarray | None:
         """佐糖 scale-pro 超分（可用才调；失败/未配置返回 None 走插值降级）。
@@ -129,14 +133,19 @@ class ResizeStep:
 
             scale_client = PicwishScalePro(self._settings)
             if not scale_client.is_configured():
-                module_logger.debug("resize: scale-pro not configured → interpolation")
+                module_logger.info("resize: 佐糖未配置 → 插值放大（记 done(interpolated)）")
                 return None
+            module_logger.info(
+                "resize: 佐糖超分外呼中… 源=%dx%d", image_bgra.shape[1], image_bgra.shape[0]
+            )
             result = scale_client.upscale(image_bgra[:, :, :3])
             if result is None:
-                module_logger.warning("resize: scale-pro failed → interpolation fallback")
+                module_logger.warning(
+                    "resize: 超分失败（欠费/超时）→ 插值降级，记 done(interpolated)"
+                )
                 return None
-            module_logger.debug(
-                "resize: scale-pro %dx%d → %dx%d",
+            module_logger.info(
+                "resize: 超分成功 %dx%d → %dx%d",
                 image_bgra.shape[1], image_bgra.shape[0], result.shape[1], result.shape[0],
             )
             # 原图透明域带回复：超分上传只含 BGR（3 通道），透明信息在服务端

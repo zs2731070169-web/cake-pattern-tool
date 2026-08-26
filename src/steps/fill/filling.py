@@ -114,10 +114,13 @@ class FillStep:
         opaque = alpha_channel >= 128
         band = self._opaque_border_band(opaque)
         pure_white_ratio = self._band_pure_white_ratio(analysis_bgr, band, alpha_channel)
+        module_logger.info(
+            "fill start: size=%dx%d 内容占比=%.1f%%", image_width, image_height, content_ratio * 100
+        )
         has_checkerboard = self._checkerboard_gate.has_checkerboard_background(analysis_bgr)
-        module_logger.debug("fill checkerboard gate: vl=%s", has_checkerboard)
+        module_logger.info("fill: VL 棋盘格判定=%s", has_checkerboard)
         if not has_checkerboard:
-            module_logger.debug("fill → skipped (背景非棋盘格)")
+            module_logger.info("fill → skipped（背景非棋盘格，零外呼）")
             return FillStepResult(image_ndarray, "skipped")
 
         # ---- 棋盘格 → 生成式换白底（v18.6：生成成功即交付，验证门移除）----
@@ -135,11 +138,14 @@ class FillStep:
                 )
                 return self._deliver_generated(image_ndarray, cached, "白色背景")
             try:
+                module_logger.info("fill: 棋盘格已判真 → qwen-image 换白外呼中…")
                 generated = self._qwen_bg.replace_background(analysis_bgr)
             except Exception as api_error:  # 客户端契约外的意外异常也降级，不 failed
                 module_logger.warning("fill gen api unexpected error: %s", api_error)
                 generated = None
-            module_logger.debug("fill gen api result=%s", "ok" if generated is not None else "failed")
+            module_logger.info(
+                "fill: 换白生成%s", "成功" if generated is not None else "失败（欠费/超时——原图交付记 failed）"
+            )
             if generated is not None:
                 # 生成成功即交付（v18.6，2026-08-26 用户定案"直接交给模型"——
                 self._gen_cache.put(analysis_bgr, generated)
@@ -148,10 +154,12 @@ class FillStep:
                 )
                 return self._deliver_generated(image_ndarray, generated, "白色背景")
 
-        # ---- 兜底（v17 起）：未触发/生成式失败 → 原图原样，不产出半成品 ----
+        # ---- 兜底（v17 起）：未触发 → skipped；生成式已触发但失败 → failed
+        # （2026-08-27 定案："该换白但没换成"（欠费/超时）与"非棋盘格不用换"
+        # 分开记档，前端红显"执行失败"；原图零误伤交付不变） ----
         module_logger.debug("fill → passthrough: gen_attempted=%s", gen_attempted)
         if gen_attempted:
-            return FillStepResult(image_ndarray, "done(degraded)")
+            return FillStepResult(image_ndarray, "failed")
         return FillStepResult(image_ndarray, "skipped")
 
     @staticmethod

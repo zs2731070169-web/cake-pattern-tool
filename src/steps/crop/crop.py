@@ -51,19 +51,25 @@ class CropStep:
         shape_value = crop_meta.get("shape")
         box = crop_meta.get("data") or {}
         frame = crop_meta.get("frame") or {}
+        module_logger.info("crop start: shape=%s box=%s", shape_value, "有" if box else "无")
         if shape_value not in KNOWN_CROP_SHAPES:
-            module_logger.debug("crop: invalid shape (%s) → passthrough", shape_value)
+            module_logger.info("crop → skipped (未知形状 %s)", shape_value)
             return CropStepResult(image_ndarray, "skipped")
         image_bgra = ensure_bgra(image_ndarray)
         if not self._box_valid(box):
             # 无框合法声明（默认 circle / 旧格式）：整图即框——直接形状塑形
             # 不裁切（无外接框语义），形状外 alpha=0
             if shape_value in ("circle", "heart", "star"):
-                module_logger.debug("crop: no box, shape=%s on full canvas", shape_value)
+                module_logger.info(
+                    "crop → done: shape=%s 无框整图塑形 %dx%d",
+                    shape_value, image_bgra.shape[1], image_bgra.shape[0],
+                )
                 shape_mask = crop_shape_region_mask(
                     shape_value, image_bgra.shape[1], image_bgra.shape[0]
                 )
                 image_bgra[:, :, 3] = np.where(shape_mask, image_bgra[:, :, 3], 0)
+            else:
+                module_logger.info("crop → done: shape=%s 矩形无框=整图直通", shape_value)
             return CropStepResult(image_bgra, "done")
 
         image_bgra = ensure_bgra(image_ndarray)
@@ -89,13 +95,13 @@ class CropStep:
         crop_w = min(crop_w, image_width - x)
         crop_h = min(crop_h, image_height - y)
         if crop_w <= 0 or crop_h <= 0:
-            module_logger.debug("crop: box out of range → passthrough")
+            module_logger.info("crop → skipped (框越界 %s)", shape_value)
             return CropStepResult(image_ndarray, "skipped")
 
         result = image_bgra[y : y + crop_h, x : x + crop_w].copy()
-        module_logger.debug(
-            "crop: shape=%s box=(%d,%d,%d,%d) frame=%dx%d→%dx%d",
-            shape_value, x, y, crop_w, crop_h, source_w, source_h, image_width, image_height,
+        module_logger.info(
+            "crop → done: shape=%s 框=(%d,%d %dx%d) %dx%d→%dx%d",
+            shape_value, x, y, crop_w, crop_h, source_w or image_width, source_h or image_height, crop_w, crop_h,
         )
         if shape_value in ("circle", "heart", "star"):
             shape_mask = crop_shape_region_mask(shape_value, crop_w, crop_h)

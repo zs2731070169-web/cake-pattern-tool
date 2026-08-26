@@ -8,12 +8,12 @@
   <title>糯米纸图案自动化修图工具</title>
   <link rel="stylesheet" href="vendor/cropper.min.css">
   <style>
-    /* ---- 基础布局：移动优先（C 端主流在手机聊天内嵌浏览器） ---- */
+    /* ---- 基础布局：桌面 Web 端（2026-08-27 修订——只作桌面用，760px 移动优先撤销） ---- */
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
       background: #f5f6f8; color: #222; line-height: 1.6;
-      max-width: 760px; margin: 0 auto; padding: 16px 16px 96px;
+      max-width: 1100px; margin: 0 auto; padding: 16px 16px 96px;
     }
     header { text-align: center; padding: 12px 0 4px; }
     header h1 { font-size: 22px; }
@@ -22,21 +22,79 @@
     section { background: #fff; border-radius: 12px; padding: 16px; margin-top: 14px; box-shadow: 0 1px 4px rgba(0,0,0,.05); }
     section h2 { font-size: 16px; margin-bottom: 10px; }
 
-    /* ---- 上传区 ---- */
+    /* ---- 双栏同屏主区（2026-08-27 第六次修订：左上传/右结果同屏共存，
+       上传→提交→看结果不再纵向滚动；窄屏（<960px）退回单栏） ----
+       2026-08-27 对齐修正：等宽 1fr/1fr + stretch 等高（用户实测右宽左窄不齐）；
+       右栏结果卡横排图需要更宽画布，左栏上传列表自动撑满同行 */
+    #main-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: stretch; margin-top: 14px; }
+    #main-grid > section { margin-top: 0; display: flex; flex-direction: column; }
+    #main-grid > section > h2 { flex: 0 0 auto; }
+    #upload-list { flex: 1 1 auto; }
+    /* 底部按钮行对齐（2026-08-27：结果列表同样 flex 占满，"再处理一批"与
+       "开始处理"都贴各自卡片底边——stretch 等高下两按钮同一水平线） */
+    #result-list { flex: 1 1 auto; }
+    #submit-row button, #restart-row button { font-size: 15px; padding: 10px 32px; }
+    @media (max-width: 960px) { #main-grid { grid-template-columns: 1fr; } }
+
+    /* 统一尺寸批量行（2026-08-27 第七次修订；同日位置修订：与标题同行右对齐，
+       独立行撤销——用户标注期望位置 + hint 提示行已删） */
+    .batch-size-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    #upload-panel .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+    #upload-panel .panel-head h2 { margin-bottom: 0; }
+
+    /* 自绘下拉（2026-08-27 定稿：浮层模式——绝对定位悬浮于选择器下方，
+       不顶开任何元素；用户实测"推开内容"版不满意，改回浮层但保留自绘
+       外观与滑出动画。原生 select 弃用原因：选项样式/定位不可控） */
+    .size-dropdown { min-width: 190px; position: relative; }
+    .size-dropdown-trigger {
+      width: 100%; text-align: left; background: #fff; border: 1px solid #e5e7eb;
+      border-radius: 6px; padding: 4px 10px; font-size: 12px; color: #555;
+      display: flex; justify-content: space-between; align-items: center; gap: 6px;
+    }
+    .size-dropdown-trigger::after { content: '▾'; color: #999; font-size: 10px; transition: transform .2s; }
+    .size-dropdown.open .size-dropdown-trigger::after { transform: rotate(180deg); }
+    .size-dropdown-menu {
+      position: absolute; top: calc(100% + 6px); left: 0; z-index: 50;
+      width: 100%; /* 与触发按钮同宽（菜单宽度跟选择器，不再按内容自适应） */
+      max-height: 0; overflow: hidden; transition: max-height .25s ease;
+    }
+    .size-dropdown.open .size-dropdown-menu { max-height: 420px; }
+    .size-dropdown-menu-inner {
+      border: 1px solid #e5e7eb; border-radius: 6px; background: #fff;
+      padding: 4px 0; box-shadow: 0 4px 16px rgba(0,0,0,.12);
+    }
+    .size-dropdown-menu-inner .menu-option {
+      padding: 5px 12px; font-size: 13px; color: #333; cursor: pointer; white-space: nowrap;
+    }
+    .size-dropdown-menu-inner .menu-option:hover { background: #f0f6ff; color: #2563eb; }
+    .size-dropdown-menu-inner .menu-option.selected { color: #2563eb; font-weight: 600; }
+
+    /* ---- 上传区（桌面：收窄虚线框，左右空间留给已选缩略图） ---- */
     #upload-drop-zone {
-      border: 2px dashed #c8ccd4; border-radius: 12px; padding: 28px 12px;
+      border: 2px dashed #c8ccd4; border-radius: 12px; padding: 26px 12px;
       text-align: center; color: #888; cursor: pointer; transition: border-color .2s;
     }
     #upload-drop-zone.dragover { border-color: #3b82f6; background: #f0f6ff; }
     #upload-drop-zone .main-hint { font-size: 15px; color: #333; }
     #upload-drop-zone .sub-hint { font-size: 12px; margin-top: 4px; }
 
-    /* ---- 图片列表（上传预览 + 结果展示共用卡片结构） ---- */
+    /* ---- 图片列表（2026-08-27 用户定案：左右两栏同构 3×3 网格——
+         结果横排大卡撤销，查看细节走 hover 放大浮层） ---- */
     .image-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-top: 12px; }
+    #result-list.image-list { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
     .image-card {
       border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; background: #fafafa;
       display: flex; flex-direction: column; position: relative;
     }
+    /* 结果卡横排大卡布局已撤（2026-08-27 用户定案 3×3 同构网格）；
+       卡内结构与上传卡一致：竖排缩略图 + 信息 + 动作 */
+    /* 悬停放大角标（可发现性：hover 浮层此前无任何入口提示） */
+    .thumb-wrap .zoom-hint {
+      position: absolute; bottom: 6px; right: 6px; z-index: 2;
+      background: rgba(0,0,0,.55); color: #fff; border-radius: 4px;
+      font-size: 11px; padding: 1px 6px; pointer-events: none; opacity: 0; transition: opacity .15s;
+    }
+    .thumb-wrap.zoomable:hover .zoom-hint { opacity: 1; }
     .image-card .thumb-wrap { position: relative; width: 100%; aspect-ratio: 1; background: repeating-conic-gradient(#eee 0 25%, #fff 0 50%) 0 0/16px 16px; }
     .image-card img.thumb { width: 100%; height: 100%; object-fit: contain; }
     .image-card .card-info { padding: 8px; font-size: 12px; }
@@ -52,6 +110,8 @@
     .tag.skipped { background: #f1f2f4; color: #999; }
     .tag.fallback { background: #fff4e5; color: #b25e09; }
     .tag.hint-low-res, .tag.hint-heavy-watermark { background: #fdeaea; color: #c0392b; }
+    /* 步骤执行失败（2026-08-27：超分降级等——红底红字，一眼可辨） */
+    .tag.failed { background: #fdeaea; color: #c0392b; font-weight: 600; }
 
     .status-text { font-size: 12px; color: #666; }
     .status-text.processing { color: #2563eb; }
@@ -63,8 +123,10 @@
       border: none; border-radius: 8px; cursor: pointer; font-size: 13px;
       padding: 6px 12px; background: #eef1f5; color: #333;
     }
-    button.primary { background: #2563eb; color: #fff; font-size: 15px; padding: 10px 0; width: 100%; }
+    button.primary { background: #2563eb; color: #fff; font-size: 15px; padding: 10px 32px; width: auto; min-width: 180px; }
     button.primary:disabled { background: #9db8e0; cursor: not-allowed; }
+    /* 提交行：定宽按钮右对齐（桌面规范——原全宽拇指按钮是移动规范） */
+    #submit-row { margin-top: 14px; display: flex; justify-content: flex-end; }
     button.danger { color: #c0392b; }
     button.ghost { background: #fff; border: 1px solid #d7dbe2; }
 
@@ -104,6 +166,32 @@
       width: 10px; height: 10px; opacity: .7;
     }
 
+    /* ---- 结果删除（2026-08-27 终版：勾选框已撤——标题行"全部删除"+确认弹窗；
+       卡片内保留单张删除钮；前端会话级，文件仍由后端 24h TTL 清理） ---- */
+
+    /* 结果区标题行右侧页面级按钮（2026-08-27 用户定案：下载/删除两个按钮
+       放"2. 处理结果"标题行右侧——与左栏"统一尺寸"标题行同构；卡片上
+       不再有按钮） */
+    #result-panel .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+    #result-panel .panel-head h2 { margin-bottom: 0; }
+    #result-panel .panel-head .head-actions { display: flex; gap: 8px; align-items: center; }
+    #result-panel .panel-head .head-actions .danger-ghost { color: #c0392b; background: #fff; border: 1px solid #f0c8c8; }
+
+    /* ---- 顶部小弹窗 toast（2026-08-27：按钮反馈统一入口——下载/删除/复制
+       的结果提示不再原地改文字，顶部滑入自动消失） ---- */
+    #toast-layer {
+      position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+      z-index: 300; display: flex; flex-direction: column; gap: 8px; align-items: center;
+      pointer-events: none;
+    }
+    .toast-item {
+      background: rgba(20, 24, 32, .88); color: #fff; font-size: 13px;
+      border-radius: 8px; padding: 8px 18px; box-shadow: 0 4px 16px rgba(0,0,0,.25);
+      opacity: 0; transform: translateY(-8px); transition: all .25s ease;
+    }
+    .toast-item.show { opacity: 1; transform: translateY(0); }
+    .toast-item.toast-error { background: rgba(160, 30, 30, .92); }
+
     /* ---- 结果动作条 ---- */
     .result-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 
@@ -120,14 +208,18 @@
     #result-zoom-layer.active { display: block; }
     #result-zoom-layer img { display: block; max-width: none; max-height: none; }
     .image-card .thumb-wrap.zoomable { cursor: zoom-in; }
+    /* 上传卡片 hover 反馈（2026-08-27：鼠标扫过有轻微抬升，列表可交互感） */
+    .image-card:hover { border-color: #b8c2d0; }
     .result-actions a.download-link {
       text-decoration: none; background: #2563eb; color: #fff; border-radius: 8px;
       padding: 6px 12px; font-size: 13px; display: inline-block;
     }
 
-    /* ---- 免责声明（页脚常驻，7 章合规红线） ---- */
+    /* ---- 免责声明（页脚常驻，7 章合规红线；2026-08-27 对齐修正：
+       与双栏卡片同宽左右对齐——原限宽 600px 居中在双栏下显得脱节） ---- */
     footer { margin-top: 20px; font-size: 12px; color: #999; text-align: center; }
     footer .disclaimer { text-align: left; background: #fff; border-radius: 10px; padding: 10px 12px; }
+    footer .disclaimer .ttl-hint { display: block; margin-top: 4px; color: #b0b0b0; }
 
     .mobile-hint { display: none; font-size: 12px; color: #2563eb; margin-top: 4px; }
     @media (pointer: coarse) { .mobile-hint { display: block; } .desktop-only { display: none; } }
@@ -136,35 +228,57 @@
 <body>
   <header>
     <h1>糯米纸图案自动化修图工具</h1>
-    <p>上传 → 自动去水印 / 填充 / 裁剪 / 描边 / 变清晰 → 长按或下载保存成品</p>
+    <p>上传 → 自动去水印 / 填充 / 裁剪 / 描边 / 变清晰 → 下载保存成品</p>
   </header>
 
-  <!-- 上传面板 -->
-  <section id="upload-panel">
-    <h2>1. 选择图片（1–9 张）</h2>
-    <div id="upload-drop-zone">
-      <div class="main-hint">点击选择 或 拖拽图片到这里</div>
-      <div class="sub-hint" id="upload-limits-hint">支持 PNG / JPG / WebP</div>
-      <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" multiple hidden>
-    </div>
-    <div class="image-list" id="upload-list"></div>
-    <div style="margin-top: 14px;">
-      <button class="primary" id="submit-button" disabled>开始处理</button>
-    </div>
-  </section>
+  <!-- 双栏主区：左上传（常驻）/ 右结果（常驻，未提交时引导文案） -->
+  <div id="main-grid">
+    <!-- 左栏：上传面板 -->
+    <section id="upload-panel">
+      <div class="panel-head">
+        <h2>1. 选择图片（1–9 张）</h2>
+        <!-- 统一尺寸批量（2026-08-27 自绘下拉：选项从选择器下方滑出推开内容，
+             不再浮层遮挡）：选中即应用到全部待处理图 -->
+        <div class="batch-size-row">
+          <span style="font-size:13px;color:#555;">统一尺寸：</span>
+          <div class="size-dropdown" id="batch-size-dropdown">
+            <button type="button" class="size-dropdown-trigger" id="batch-size-trigger">不设置</button>
+            <div class="size-dropdown-menu"><div class="size-dropdown-menu-inner" id="batch-size-menu"></div></div>
+          </div>
+        </div>
+      </div>
+      <div id="upload-drop-zone">
+        <div class="main-hint">点击选择 / 拖拽 / Ctrl+V 粘贴图片</div>
+        <div class="sub-hint" id="upload-limits-hint">支持 PNG / JPG / WebP</div>
+        <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" multiple hidden>
+      </div>
+      <div class="image-list" id="upload-list"></div>
+      <div id="submit-row">
+        <button class="primary" id="submit-button" disabled>开始处理</button>
+      </div>
+    </section>
 
-  <!-- 结果面板 -->
-  <section id="result-panel" style="display:none;">
-    <h2>2. 处理结果</h2>
-    <div id="batch-actions" style="display: none; margin-bottom: 10px; gap: 8px; flex-wrap: wrap;">
-      <button id="batch-download-button">批量下载</button>
-      <span id="batch-status" style="font-size: 12px; color: #888; line-height: 34px;"></span>
-    </div>
-    <div class="image-list" id="result-list"></div>
-    <div style="margin-top: 14px; display:flex; gap:10px;">
-      <button class="ghost" id="restart-button" style="flex:1;">再处理一批</button>
-    </div>
-  </section>
+    <!-- 右栏：结果面板（双栏常驻——原 display:none 收起改引导文案占位） -->
+    <section id="result-panel">
+      <div class="panel-head">
+        <h2>2. 处理结果</h2>
+        <!-- 页面级动作（2026-08-27 用户定案：标题行右侧"下载/删除"两钮——
+             下载=当前结果打包 ZIP，删除=删除勾选；有结果才可用） -->
+        <div class="head-actions" id="result-head-actions">
+          <button id="batch-download-button" disabled>批量下载</button>
+          <button id="batch-delete-button" class="danger-ghost" disabled>批量删除</button>
+        </div>
+      </div>
+      <!-- 过程反馈条（打包进度等瞬时提示；常驻引导文案已撤） -->
+      <div id="batch-actions" style="display: none; margin-bottom: 10px; gap: 8px;">
+        <span id="batch-status" style="font-size: 12px; color: #888; line-height: 34px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></span>
+      </div>
+      <div class="image-list" id="result-list"></div>
+      <div id="restart-row" style="margin-top: 14px; display:flex; gap:10px;">
+        <button class="ghost" id="restart-button" style="flex:1;">再处理一批</button>
+      </div>
+    </section>
+  </div>
 
   <!-- 裁剪弹层（逐图可选，默认收起） -->
   <div id="crop-modal">
@@ -190,9 +304,11 @@
   <!-- 结果图悬停放大浮层（跟随鼠标，桌面专用；触屏无 hover 自动不触发） -->
   <div id="result-zoom-layer"><img alt="放大查看"></div>
 
+  <!-- 顶部小弹窗（按钮反馈：下载/删除/复制结果提示） -->
+  <div id="toast-layer"></div>
+
   <footer>
     <div class="disclaimer" id="disclaimer-text">免责声明加载中…</div>
-    <p style="margin-top:8px;">图片 24 小时后自动删除</p>
   </footer>
 
   <script src="vendor/cropper.min.js"></script>
