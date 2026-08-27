@@ -16,8 +16,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - 需要 Python 3.11 或 3.12（3.13+ 的 opencv/rembg 轮子未验证）；服务地址 http://localhost:8200（`PT_PORT`）。
 - **uvicorn worker=1 是硬前提**（SQLite 单写者，技术方案 6 节），进程内单例（配置/连接池/线程池）都依赖它，不要改。
-- `start.sh` 每次启动**清空 `data/`**（调试期口径）；生产部署注释掉 `clear_runtime_data` 调用。
-- 外部 API（百炼 qwen-vl/qwen-image、佐糖 PicWish）全部有配置开关，未配 key 时对应步零误伤跳过——测试不需要任何真实 key。
+- `start.sh` 每次启动清理 `data/` 下批次/库/缓存（**保留 `data/logs/`**——崩溃后重启排障要日志；调试期口径）；生产部署注释掉 `clear_runtime_data` 调用。
+- 外部 API（百炼 qwen-vl/qwen-image、石榴智能去水印、佐糖超分 scale-pro）全部有配置开关，未配 key 时对应步零误伤跳过——测试不需要任何真实 key。佐糖超分第十八次修订复活（key 充值，scale-pro 主力）；去水印仍石榴唯一。
 
 ## 工作流铁律：文档先行
 
@@ -31,11 +31,11 @@ C 端自助修图工具：上传 1-9 张图 → 五步管线 → 透明 PNG 成�
 
 **五步管线**（`pipeline.py::_run_steps`，每步独立 skipped，单图失败不影响批内其他图）：
 
-1. **去水印**：qwen-vl 语义预检判有无（唯一检测器）→ 有才调佐糖 PicWish 高级版修复；失败=原图+`failed` 记档（该修没修成）。
+1. **去水印**：qwen-vl 语义预检判有无（唯一检测器）→ 有才调石榴智能高级版修复（async_submit→async_fetch 异步轮询，唯一供应商，佐糖已下线）；失败=原图+`failed` 记档（该修没修成）。
 2. **填充**：qwen-vl 判棋盘格背景 → qwen-image-2.0 生成式换纯白底；非棋盘格 skipped。
 3. **裁剪**：按前端**声明**（shape+框）运行时执行——框裁外接区+形状掩膜塑形（形状外 alpha=0）。
 4. **描边**：形状边带白底判定 → rembg 分割兜底灰度阈值 → 沿**形状边界**内缩画 1.5mm@300DPI 灰线（打印裁切参考线）。
-5. **尺寸缩放**：按打印档（cm）缩放到 @300DPI 目标短边；缩小 INTER_AREA，放大优先佐糖超分失败 Lanczos 兜底。
+5. **尺寸缩放**：按打印档（cm，自定义上限 33cm=iX6880 A3+）缩放到 @300DPI 目标短边；缩小 INTER_AREA；放大走佐糖 scale-pro 高级变清晰（2026-08-28 第十八次修订，sync=0 显式异步提交-轮询-下载，服务端定倍，出幅对齐目标缩回/补尾程）；失败记 failed 整图不交付（第十七次修订语义——废图交付不是保交付）。
 
 **棋盘格顺序门**：原始图问 VL 是否棋盘格背景，true 则顺序换为 填充→去水印（去水印生成会重绘棋盘格致填充判定失效）。
 
@@ -57,7 +57,7 @@ C 端自助修图工具：上传 1-9 张图 → 五步管线 → 透明 PNG 成�
 
 ### 记档与失败语义
 
-`stage_results` 值域：`done` / `done(api)` / `done(interpolated)` / `skipped` / `failed`。核心区分（2026-08-27 定案）：**"该修但没修成"（欠费/超时）记 `failed`** 前端红显"执行失败"；**"不需要修"（无水印/非棋盘格）记 `skipped`**。外部 API 失败一律**原图零误伤交付**，不让整图 failed——降级不断交付。`error_msg` 脱敏（不含路径/堆栈），key 绝不进前端/日志/错误信息。
+`stage_results` 值域：`done` / `done(api)` / `skipped` / `failed`（`done(interpolated)` 已于 2026-08-28 第十七次修订退役）。核心区分：**"该修但没修成"（欠费/超时）记 `failed`** 前端红显"执行失败"；**"不需要修"（无水印/非棋盘格）记 `skipped`**。去水印失败原图零误伤交付；**放大失败整图 failed 不交付**（插值废图不是交付）。`error_msg` 脱敏（不含路径/堆栈），key 绝不进前端/日志/错误信息。
 
 ### 已退役方案（不要重新引入）
 
@@ -67,7 +67,12 @@ C 端自助修图工具：上传 1-9 张图 → 五步管线 → 透明 PNG 成�
 - 填充的本地像素判据（白度占比/色簇/熵）——米白误放、卡通主体拉高熵；改 qwen-vl 棋盘格判定。
 - isnet/u2net 分割填白与拓扑填白（Path B）——分割毛边污染主体、淡彩主体误漂白。
 - 生成式输出的本地验证门与色阶归一（v18.6）——模型对复杂主体稳定输出 247-249 纸白，252 纯白口径拒致整类图失效；**生成成功即原样交付，不做任何本地像素后处理**。
-- qwen-image 做去水印修复——多图实测效果不理想，回退佐糖。
+- qwen-image 做去水印修复——多图实测效果不理想，回退。
+- 佐糖 PicWish 去水印——第十次修订下线（成本 4~6 倍于石榴），`watermark_picwish.py` 已删恢复需从 git 历史。佐糖超分曾第十一次修订下线、**第十八次修订复活**（key 充值 + 石榴历版目检不符），`picwish_scale.py` 现役主力。
+- 佐糖万物抠图做填充换白底（2026-08-28 实测否决）——分割式对浅色主体误分割：
+  e9455 真图主体仅保留 32.1%（蛋糕浅色部分灰度 216-245 被当背景抠掉），用户判定不符合要求；
+  与 rembg/isnet 退役同根（浅色主体 vs 背景界限模糊必翻车），生成式 qwen-image-2.0 维持现役。
+- **石榴全部超分形态（2026-08-28 第十八次修订全线退役，`shiliu_scale.py` 已删，回退从 git 历史）**——基础版（锐化感强）、大图变高清 width 直出（超倍率锐度崩）、纯大图链（边缘钝化 10.6→4.5 用户目检"变糊"）、高级×4 打底+大图续跳两段链（用户终判"历版无一符合要求"）；石榴在系统的存留职责只剩去水印。本地 Lanczos 插值兜底——9.5 倍拉伸锐度 ~3 是废图，第十七次修订删除（失败了就 failed）。
 - `low-res` quality_hint、IOPaint/LaMa 本地档、旧 `PT_WM_*` 像素检测键。
 
 ### 判定哲学（测量事实，不猜身份）
@@ -80,7 +85,7 @@ C 端自助修图工具：上传 1-9 张图 → 五步管线 → 透明 PNG 成�
 
 ### 配置
 
-`src/core/config.py::PatternToolSettings`（pydantic-settings，键前缀 `PT_`）是配置唯一入口——任何模块不得绕过它自行读 `os.environ`。优先级：真实环境变量 > `.env` > 字段默认值；`.env.example` 是逐项注释的模板（键与字段一一对应，改配置项三处同步）。
+`src/core/config.py::PatternToolSettings`（pydantic-settings，键前缀 `PT_`）是配置唯一入口——任何模块不得绕过它自行读 `os.environ`。优先级：真实环境变量 > `.env` > 字段默认值；`.env.example` 是逐项注释的模板（键与字段一一对应，改配置项三处同步）。日志配置在 `src/core/logger.py::configure_logging`（lifespan 启动段自动创建单例，幂等；入口不在 main.py）：控制台 `PT_LOG_LEVEL`（默认 INFO）/ 文件 `PT_LOG_FILE_LEVEL`（默认 DEBUG）双通道，文件落 `data/logs/app.log`（10MB×5 轮转）。
 
 ### 测试口径
 

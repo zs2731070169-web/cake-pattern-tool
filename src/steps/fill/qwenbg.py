@@ -193,6 +193,17 @@ class QwenBackgroundReplacer:
             _ENDPOINT, json=payload,
             headers={"Authorization": f"Bearer {self._settings.fill_gen_key}"},
         ))
+        if response.status_code >= 400:
+            # 400 快速拒绝时 httpx 异常只带状态行，DashScope 的 code/message
+            # 在 body 里（如模型与端点不匹配的 InvalidParameter 详情）——
+            # 脱敏提取记档，避免根因只能靠手工复现（2026-08-27 wanx 误配案）
+            detail = ""
+            try:
+                error_body = response.json()
+                detail = f" code={error_body.get('code')!r} message={str(error_body.get('message'))[:200]!r}"
+            except ValueError:
+                pass
+            raise ValueError(f"qwen api http {response.status_code}{detail or ': ' + response.text[:200]}")
         response.raise_for_status()
         data = response.json()
         output = data.get("output", {})

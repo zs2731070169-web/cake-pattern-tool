@@ -268,3 +268,39 @@ def _stub_settings():
     from src.core.config import PatternToolSettings
 
     return PatternToolSettings(data_dir="/tmp/pt-shape-test-data", _env_file=None)
+
+
+def test_shape_outline_cleans_bleed_outside_shape(tmp_path):
+    """形状外颜色清洗（第二十一次修订）：放大链渗出边界的图案颜色在描边时
+    被洗白——线-边界隔离带恢复，图案不再"绕过"描边线。"""
+    from src.core.config import PatternToolSettings
+    from src.steps.outline import draw_shape_outline, crop_shape_region_mask
+
+    settings = PatternToolSettings(data_dir=str(tmp_path), _env_file=None,
+                                   outline_width_mm=1.2)
+    # 白底圆形画布 + 伪造"渗出"：形状边界外紧邻处放深色像素（模拟 LANCZOS 外渗）
+    canvas = np.full((400, 400, 4), (255, 255, 255, 255), np.uint8)
+    mask = crop_shape_region_mask("circle", 400, 400)
+    canvas[:, :, :3][mask] = (60, 150, 90)  # 形状内图案
+    # 形状外透明化（crop 塑形语义——alpha 边界即解析形状边界）
+    canvas[:, :, 3][~mask] = 0
+    # 渗出：形状外 0-6px 环带塞图案色（模拟放大链外渗——alpha 已被 resize
+    # 解析重画，但颜色通道的图案渗到了边界外）
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    grown = cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
+    bleed_zone = grown & ~mask
+    canvas[:, :, :3][bleed_zone] = (70, 140, 100)
+
+    outlined = draw_shape_outline(canvas, "circle", settings)
+    gray = cv2.cvtColor(outlined[:, :, :3], cv2.COLOR_BGR2GRAY)
+    # 清洗后：线带外沿与形状边界之间应为白（渗出色已被洗掉）
+    # 心形同理；此处 circle：取中线行验证边界附近
+    row = 100  # 非直径行：左右侧弧有真实边界（直径行贯穿全幅无下落沿）
+    alpha = outlined[:, :, 3]
+    # 直径行：右边界（形状内→形状外的下落沿）
+    trans = np.where((alpha[row, :-1] >= 128) & (alpha[row, 1:] < 128))[0]
+    assert len(trans), "应有形状边界"
+    c = trans[-1]
+    # 边界外侧 1-5px（原渗出区）：渗出色必须被洗白（alpha 已透明，颜色值本身干净）
+    outside_pixels = outlined[row, c+1:c+6, :3]
+    assert (outside_pixels >= 248).all(), f"边界外渗出色未清洗: {outside_pixels[:, 0].tolist()}"

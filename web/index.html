@@ -117,6 +117,8 @@
     .status-text.processing { color: #2563eb; }
     .status-text.completed { color: #1a7f37; }
     .status-text.failed { color: #c0392b; }
+    /* 处理耗时计时（2026-08-27）：等宽数字防跳动，弱化色不抢状态主色 */
+    .elapsed-timer { font-variant-numeric: tabular-nums; color: #9aa4b2; margin-left: 4px; }
 
     /* ---- 按钮 ---- */
     button {
@@ -228,7 +230,7 @@
 <body>
   <header>
     <h1>糯米纸图案自动化修图工具</h1>
-    <p>上传 → 自动去水印 / 填充 / 裁剪 / 描边 / 变清晰 → 下载保存成品</p>
+    <p>上传 → 自动去水印 / 填充 / 裁剪 / 变清晰 / 描边 → 下载保存成品</p>
   </header>
 
   <!-- 双栏主区：左上传（常驻）/ 右结果（常驻，未提交时引导文案） -->
@@ -313,6 +315,6 @@
 
   <script src="vendor/cropper.min.js"></script>
     <script src="vendor/storezip.js"></script>
-  <script src="app.js"></script>
+  <script src="app.js?v=20260828"></script>
 </body>
 </html>

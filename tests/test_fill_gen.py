@@ -322,6 +322,8 @@ def test_gen_request_payload_shape(tmp_path):
     captured = {}
 
     class _FakeResponse:
+        status_code = 200
+
         def raise_for_status(self):
             return None
 
@@ -404,27 +406,28 @@ def test_resize_downscale_local(tmp_path):
 
 
 def test_resize_invalid_size_skipped(tmp_path):
-    """非法尺寸（超 5-100 区间）→ skipped 原幅。"""
+    """非法尺寸（超 5-33 区间，上限=iX6880 A3+ 定标）→ skipped 原幅。"""
     from src.steps.resize import ResizeStep
 
     canvas = np.full((500, 500, 3), 250, np.uint8)
-    for bad in (0.5, 300.0):
+    for bad in (0.5, 34.0, 300.0):
         result = ResizeStep(_gen_settings(tmp_path)).run(canvas, bad)
         assert result.stage_value == "skipped"
 
 
-# ---- 放大路径（2026-08-27 恢复佐糖超分）----
+# ---- 放大路径（2026-08-27 第十一次修订：石榴大图变高清 width 直出）----
 
 
 def test_resize_upscale_prefers_super_resolution(tmp_path, monkeypatch):
-    """放大优先佐糖超分：mock 返回 3 倍图 → 以超分结果为基础补尾程到目标。"""
+    """放大单外呼石榴大图变高清：mock width 直出 → 目标尺寸直达记 done。"""
     from src.steps.resize import ResizeStep, picwish_scale
 
-    settings = _gen_settings(tmp_path)
+    settings = _gen_settings(tmp_path, scale_enabled=True, picwish_api_key="test-key")
 
     def _fake_upscale(self, image_bgr):
-        # 3 倍超分（2048 上限内）：500→1500
-        return cv2.resize(image_bgr, (1500, 1500), interpolation=cv2.INTER_CUBIC)
+        # 服务端定倍语义：出 4 倍幅（500 方图 → 2000），出幅≥目标的档由步内缩回
+        return cv2.resize(image_bgr, (image_bgr.shape[1] * 4, image_bgr.shape[0] * 4),
+                          interpolation=cv2.INTER_CUBIC)
 
     monkeypatch.setattr(picwish_scale.PicwishScalePro, "upscale", _fake_upscale)
     monkeypatch.setattr(
@@ -433,42 +436,82 @@ def test_resize_upscale_prefers_super_resolution(tmp_path, monkeypatch):
 
     canvas = np.full((500, 500, 3), 250, np.uint8)
     cv2.circle(canvas, (250, 250), 150, (60, 180, 90), -1)
-    # 12寸=29cm → 目标短边 3425：超分 1500 仍不足 → Lanczos 补尾程
+    # 12寸=29cm → 目标短边 3425：×4 stub 出 2000 → 尾程 1.7x 触发换大图建议
     result = ResizeStep(settings).run(canvas, 29.0)
     assert result.stage_value == "done"
     assert min(result.image_bgr.shape[:2]) == 3425
-    assert result.quality_hint == "none"  # 超分成功：不提示 low-res
+    assert result.quality_hint == "suggest-larger-source"  # 尾程 1.7x>1.15 提示（2026-08-28）
 
 
-def test_resize_upscale_fallback_interpolation(tmp_path, monkeypatch):
-    """佐糖失败 → Lanczos 插值降级保交付；记档 done(interpolated)
-    （2026-08-27 定案：前端分辨率格红显"执行失败"——降级对客户可见）。"""
+def test_resize_upscale_failure_marks_failed(tmp_path, monkeypatch):
+    """石榴超分失败 → 记 failed 不交付插值废图（2026-08-28 第十七次修订，
+    用户定案"失败了就失败了"：9.5 倍拉伸锐度 ~3 是废图，交付废图不是保交付）。"""
     from src.steps.resize import ResizeStep, picwish_scale
 
-    settings = _gen_settings(tmp_path)
+    settings = _gen_settings(tmp_path, scale_enabled=True, picwish_api_key="test-key")
     monkeypatch.setattr(
         picwish_scale.PicwishScalePro, "is_configured", lambda self: True
     )
     monkeypatch.setattr(
-        picwish_scale.PicwishScalePro, "upscale", lambda self, image_bgr: None
+        picwish_scale.PicwishScalePro, "upscale",
+        lambda self, image_bgr: None,
     )
 
     canvas = np.full((500, 500, 3), 250, np.uint8)
     result = ResizeStep(settings).run(canvas, 29.0)
-    assert result.stage_value == "done(interpolated)"
-    assert min(result.image_bgr.shape[:2]) == 3425
-    assert result.quality_hint == "none"
+    assert result.stage_value == "failed"
+    assert result.image_bgr.shape[:2] == canvas.shape[:2]  # 原幅回传（不插值放大）
 
 
-def test_resize_upscale_not_configured_interpolation(tmp_path):
-    """佐糖未配置（默认 _gen_settings 无 key）→ 直接插值；
-    记档 done(interpolated)（同失败口径——超分没跑就是没跑）。"""
+def test_resize_upscale_not_configured_marks_failed(tmp_path):
+    """石榴超分未配置（scale_enabled 关）→ 记 failed（同失败口径——
+    超分没跑就是没跑，第十七次修订起不再插值交付）。"""
     from src.steps.resize import ResizeStep
 
     settings = _gen_settings(tmp_path)
-    assert not settings.wm_api_enabled  # 前置：该夹具本就未配置佐糖
+    assert not settings.scale_enabled  # 前置：该夹具默认未启用超分
     canvas = np.full((500, 500, 3), 250, np.uint8)
     result = ResizeStep(settings).run(canvas, 29.0)
-    assert result.stage_value == "done(interpolated)"
-    assert min(result.image_bgr.shape[:2]) == 3425
+    assert result.stage_value == "failed"
+    assert result.image_bgr.shape[:2] == canvas.shape[:2]  # 原幅回传
+
+
+def test_resize_tail_stretch_sets_suggest_hint(tmp_path, monkeypatch):
+    """尾程提示（2026-08-28）：佐糖出幅 < 目标（尾程放大 >1.15x）→ 
+    quality_hint=suggest-larger-source（前端黄标建议换大图）。"""
+    from src.steps.resize import ResizeStep, picwish_scale
+
+    settings = _gen_settings(tmp_path, scale_enabled=True, picwish_api_key="test-key")
+
+    def _small_out(self, image_bgr):
+        # 服务端定倍 stub：只出 1.5 倍（模拟小出幅 → 12寸档 3425 需大尾程）
+        return cv2.resize(image_bgr, (image_bgr.shape[1]*3//2, image_bgr.shape[0]*3//2),
+                          interpolation=cv2.INTER_CUBIC)
+
+    monkeypatch.setattr(picwish_scale.PicwishScalePro, "upscale", _small_out)
+    monkeypatch.setattr(picwish_scale.PicwishScalePro, "is_configured", lambda self: True)
+
+    canvas = np.full((500, 500, 3), 250, np.uint8)
+    result = ResizeStep(settings).run(canvas, 29.0)  # 12寸 3425：出幅 750 → 尾程 4.6x
+    assert result.stage_value == "done"
+    assert result.quality_hint == "suggest-larger-source"
+
+
+def test_resize_no_tail_no_hint(tmp_path, monkeypatch):
+    """出幅 ≥ 目标（无尾程）→ 不提示（quality_hint=none）。"""
+    from src.steps.resize import ResizeStep, picwish_scale
+
+    settings = _gen_settings(tmp_path, scale_enabled=True, picwish_api_key="test-key")
+
+    def _big_out(self, image_bgr):
+        # 出 8 倍幅 ≥ 3425 → INTER_AREA 缩回，零尾程
+        return cv2.resize(image_bgr, (image_bgr.shape[1]*8, image_bgr.shape[0]*8),
+                          interpolation=cv2.INTER_CUBIC)
+
+    monkeypatch.setattr(picwish_scale.PicwishScalePro, "upscale", _big_out)
+    monkeypatch.setattr(picwish_scale.PicwishScalePro, "is_configured", lambda self: True)
+
+    canvas = np.full((500, 500, 3), 250, np.uint8)
+    result = ResizeStep(settings).run(canvas, 29.0)
+    assert result.stage_value == "done"
     assert result.quality_hint == "none"

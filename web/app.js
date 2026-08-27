@@ -26,6 +26,39 @@
     'star': '星形',
   };
 
+  // ---- 处理耗时计时（2026-08-27：卡片任务执行时显示消耗时间）----
+  // 口径：从提交时刻起算的墙钟耗时（含排队——对客户"等多久"最诚实）；
+  // 卡片 DOM 每 10s 轮询重建，计时靠闭包引用的 span 每 500ms 刷新文本，
+  // 轮询到达终态（completed/failed）后定格最后一次数值。
+  var jobSubmittedAtMs = null;
+  var elapsedTimerId = null;
+
+  function formatElapsed(ms) {
+    var totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    var minutes = Math.floor(totalSeconds / 60);
+    var seconds = totalSeconds % 60;
+    return minutes > 0
+      ? minutes + '分' + (seconds < 10 ? '0' : '') + seconds + '秒'
+      : seconds + '秒';
+  }
+
+  function createElapsedTimer() {
+    var span = document.createElement('span');
+    span.className = 'elapsed-timer';
+    var refresh = function () {
+      if (jobSubmittedAtMs === null) return;
+      span.textContent = formatElapsed(Date.now() - jobSubmittedAtMs);
+    };
+    refresh();
+    if (elapsedTimerId) clearInterval(elapsedTimerId);
+    elapsedTimerId = setInterval(refresh, 500);
+    return span;
+  }
+
+  function stopElapsedTimer() {
+    if (elapsedTimerId) { clearInterval(elapsedTimerId); elapsedTimerId = null; }
+  }
+
   // ---- 状态 ----
   var pendingImages = [];  // 待提交项：{ file(Blob), previewUrl, cropMeta, originalFile, originalPreviewUrl }
   var cropTargetIndex = -1; // 当前裁剪的目标（pendingImages 下标）
@@ -157,7 +190,7 @@
       sizeSelect.className = 'size-select';
       var defaultOption = document.createElement('option');
       defaultOption.value = '';
-      defaultOption.textContent = '打印尺寸：原幅';
+      defaultOption.textContent = '不设置（原图大小）';
       sizeSelect.appendChild(defaultOption);
       SIZE_OPTIONS.forEach(function (opt) {
         var option = document.createElement('option');
@@ -178,14 +211,14 @@
       sizeSelect.value = isCustomValue ? 'custom' : (item.sizeCm ? String(item.sizeCm) : '');
       sizeSelect.addEventListener('change', function () {
         if (sizeSelect.value === 'custom') {
-          var input = window.prompt('输入打印尺寸（厘米，5-100）', item.sizeCm || '15');
+          var input = window.prompt('输入打印尺寸（厘米，5-33，上限=打印机最大幅面）', item.sizeCm || '15');
           var parsed = parseFloat(input);
-          if (input != null && !isNaN(parsed) && parsed >= 5 && parsed <= 100) {
+          if (input != null && !isNaN(parsed) && parsed >= 5 && parsed <= 33) {
             item.sizeCm = parsed;
             sizeSelect.value = 'custom';
           } else {
             sizeSelect.value = item.sizeCm ? 'custom' : '';
-            if (input != null) window.alert('请输入 5-100 之间的数字');
+            if (input != null) window.alert('请输入 5-33 之间的数字（33cm 为打印机最大幅面）');
           }
         } else if (sizeSelect.value === '') {
           item.sizeCm = null;
@@ -297,7 +330,7 @@
   var batchDropdown = document.getElementById('batch-size-dropdown');
   var batchTrigger = document.getElementById('batch-size-trigger');
   var batchMenu = document.getElementById('batch-size-menu');
-  var BATCH_OPTIONS = [{ value: '', label: '不设置' }]
+  var BATCH_OPTIONS = [{ value: '', label: '不设置（原图大小）' }]
     .concat(SIZE_OPTIONS.map(function (opt) { return { value: String(opt.cm), label: '全部: ' + opt.label }; }))
     .concat([{ value: 'custom', label: '全部: 自定义 (cm)' }]);
   // "清除"选项已撤（2026-08-27 用户定案：与"不设置"语义重复）
@@ -329,6 +362,11 @@
 
   batchTrigger.addEventListener('click', function (event) {
     event.stopPropagation();
+    // 先上传再设置（2026-08-28）：无图时"统一尺寸"无作用对象，提示而非开菜单
+    if (pendingImages.length === 0) {
+      window.alert('请先上传图片，再设置统一尺寸');
+      return;
+    }
     batchDropdown.classList.toggle('open');
   });
   document.addEventListener('click', function (event) {
@@ -339,7 +377,7 @@
 
   // 提交后复位（trigger 文案 + 选中态回"不设置"；图片列表已清无需重渲）
   function resetBatchSizeSelection() {
-    setBatchTriggerLabel('不设置');
+    setBatchTriggerLabel('不设置（原图大小）');
     Array.prototype.forEach.call(batchMenu.children, function (c) {
       c.classList.toggle('selected', c.dataset.value === '');
     });
@@ -350,24 +388,24 @@
     // return，选回"不设置"后每张图仍停留原尺寸）
     if (value === '') {
       pendingImages.forEach(function (item) { item.sizeCm = null; });
-      setBatchTriggerLabel('不设置');
+      setBatchTriggerLabel('不设置（原图大小）');
       renderUploadList();
       return;
     }
     var sizeCm;
     if (value === 'custom') {
-      var input = window.prompt('输入统一打印尺寸（厘米，5-100）', '15');
+      var input = window.prompt('输入统一打印尺寸（厘米，5-33，上限=打印机最大幅面）', '15');
       var parsed = parseFloat(input);
-      if (input != null && !isNaN(parsed) && parsed >= 5 && parsed <= 100) {
+      if (input != null && !isNaN(parsed) && parsed >= 5 && parsed <= 33) {
         sizeCm = parsed;
         setBatchTriggerLabel('全部: ' + parsed + 'cm');
       } else {
-        if (input != null) window.alert('请输入 5-100 之间的数字');
+        if (input != null) window.alert('请输入 5-33 之间的数字（33cm 为打印机最大幅面）');
         // 取消输入：回退选中态到"不设置"
         Array.prototype.forEach.call(batchMenu.children, function (c) {
           c.classList.toggle('selected', c.dataset.value === '');
         });
-        setBatchTriggerLabel('不设置');
+        setBatchTriggerLabel('不设置（原图大小）');
         return;
       }
     } else {
@@ -689,6 +727,7 @@
       resetBatchSizeSelection();
       // 双栏同屏（2026-08-27 第六次修订）：右栏常驻无需显隐切换与滚动跟随
       resultList.innerHTML = '<div class="status-text processing">处理中，请稍候…</div>';
+      jobSubmittedAtMs = Date.now(); // 耗时计时起点（2026-08-27）
       startPolling();
     } catch (submitError) {
       alert(submitError.message || '提交失败，请重试');
@@ -713,13 +752,17 @@
       var response = await fetch('/api/jobs/' + submittingJobId);
       if (response.status === 404) {
         stopPolling();
+        stopElapsedTimer(); // 计时随批次终止（2026-08-27）
         resultList.innerHTML = '<div class="status-text failed">批次已过期，请重新上传</div>';
         return;
       }
       if (!response.ok) return; // 瞬时错误：下轮重试
       var jobStatus = await response.json();
       renderResults(jobStatus);
-      if (jobStatus.status === 'completed') stopPolling();
+      if (jobStatus.status === 'completed') {
+        stopPolling();
+        stopElapsedTimer(); // 全部终态：计时定格在最后一次刷新值
+      }
     } catch (networkError) { /* 网络抖动下轮重试 */ }
   }
 
@@ -873,6 +916,16 @@
       completed: '完成',
       failed: '失败',
     }[imageStatus.status] || imageStatus.status;
+    // 消耗计时（2026-08-27）：未终态挂实时计时（含排队口径）；终态定格
+    // 显示总耗时——客户对"这张图花了多久"一目了然
+    if (imageStatus.status === 'queued' || imageStatus.status === 'processing') {
+      statusLine.appendChild(createElapsedTimer());
+    } else if (jobSubmittedAtMs !== null) {
+      var finalTimer = document.createElement('span');
+      finalTimer.className = 'elapsed-timer';
+      finalTimer.textContent = formatElapsed(Date.now() - jobSubmittedAtMs);
+      statusLine.appendChild(finalTimer);
+    }
     info.appendChild(statusLine);
 
     if (imageStatus.status === 'failed' && imageStatus.error_msg) {
@@ -906,7 +959,7 @@
           }
         } else {
           // 执行失败红显（2026-08-27 用户定案）："该跑但没跑成"与"不用跑"分开——
-          // failed（去水印检出但佐糖失败 / 填充触发但生成失败）、done(interpolated)
+          // failed（去水印检出但修复失败 / 放大超分失败——2026-08-28 起不交付插值废图）
           // （超分失败走插值）一律红底"执行失败"；skipped=真没执行（无水印/
           // 非棋盘格）保持灰显"跳过"
           var isFailed = stageValue === 'failed' || stageValue === 'done(interpolated)';
@@ -928,7 +981,14 @@
       });
       info.appendChild(stageTags);
 
-      // quality_hint 警示标签渲染已撤（2026-08-27 用户定案：提示完全去掉）
+      // 尾程提示（2026-08-28 用户定案）：源图偏小（放大后清晰度打了折扣）→
+      // 黄色建议标签"建议提供更大图片"——不阻塞交付，客户可选换图重提。
+      if (imageStatus.quality_hint === 'suggest-larger-source') {
+        var suggestTag = document.createElement('div');
+        suggestTag.className = 'tag fallback';
+        suggestTag.textContent = '建议提供更大尺寸的原图（当前图片放大后清晰度有限）';
+        info.appendChild(suggestTag);
+      }
 
       var resultImage = document.createElement('img');
       resultImage.className = 'thumb';
@@ -997,6 +1057,8 @@
 
   restartButton.addEventListener('click', function () {
     stopPolling();
+    stopElapsedTimer(); // 计时随会话重置（2026-08-27）
+    jobSubmittedAtMs = null;
     submittingJobId = null;
     showResultPlaceholder(); // 双栏常驻：回引导态而非隐藏
     hideResultZoom();
@@ -1022,6 +1084,8 @@
     // 200ms 延迟（2026-08-27 定案：无延迟版鼠标扫过即闪图太吵——短门槛
     // 滤掉扫过/点按钮的路径，真停留立即跟上；离开即取消计时）
     var hoverTimer = null;
+    var closeTimer = null;
+    var isPointerOverZoomLayer = false;
     thumbWrap.addEventListener('mouseenter', function () {
       clearTimeout(hoverTimer);
       hoverTimer = setTimeout(function () {
@@ -1030,10 +1094,25 @@
         positionResultZoom();
       }, 200);
     });
-    thumbWrap.addEventListener('mousemove', positionResultZoom);
+    thumbWrap.addEventListener('mousemove', function (event) {
+      clearTimeout(closeTimer);
+      positionResultZoom(event);
+    });
+    // 2026-08-28 定案：鼠标移入放大浮层本身不关闭——只查图细节时鼠标自然
+    // 滑向大图，旧版缩略图 mouseleave 即关浮层把人挡在半路。改为"离开缩略图
+    // 且不在浮层内"才关：浮层 mouseleave 兜底 + 离开缩略图时若指针在浮层内
+    // 推迟一帧再判定。
+    resultZoomLayer.addEventListener('mouseenter', function () { isPointerOverZoomLayer = true; clearTimeout(closeTimer); });
+    resultZoomLayer.addEventListener('mouseleave', function () {
+      isPointerOverZoomLayer = false;
+      hideResultZoom();
+    });
     thumbWrap.addEventListener('mouseleave', function () {
       clearTimeout(hoverTimer);
-      hideResultZoom();
+      // 指针可能正移向浮层（两元素间有一段空隙/重叠）——短暂宽限后再判
+      closeTimer = setTimeout(function () {
+        if (!isPointerOverZoomLayer) hideResultZoom();
+      }, 120);
     });
   }
 

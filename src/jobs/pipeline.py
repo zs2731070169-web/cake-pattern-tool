@@ -5,8 +5,8 @@
 - 批内隔离：单图失败不影响其他图；
 - 超时：单图 60s 只计 processing 段；排队超 10 分钟置 failed；
 - 全局并发：服务级信号量，同时 processing ≤ 2×CPU 核数；
-- quality_hint：heavy-watermark 汇总（low-res 已撤：2026-08-26 自动提升档先撤，
-  2026-08-27 选尺寸超分档一并撤——超分效果达标，插值兜底不再提示）。
+- quality_hint：heavy-watermark / suggest-larger-source 汇总（auto-hd 自动
+  提升档 2026-08-28 第二十二次修订删除——尺寸缩放严格跟随用户声明）。
 """
 
 from __future__ import annotations
@@ -31,12 +31,6 @@ module_logger = logging.getLogger("pattern_tool.pipeline")
 # 客户失败话术（脱敏口径：不含服务端路径/堆栈，技术方案 4.3）
 GENERIC_FAILURE_MESSAGE = "处理失败，请更换图片重试"
 QUEUE_TIMEOUT_MESSAGE = "排队人数较多，请稍后错峰重试"
-
-# 自动变清晰默认档（2026-08-26 16:22 定案）：8 寸（19cm@300DPI ≈ 2244px）——
-# 常见蛋糕尺寸中档；小图自动提升到该档，不再提示"换高清图"
-AUTO_HD_SIZE_CM = 19.0
-AUTO_HD_TARGET_SHORT_SIDE = 2244
-
 
 class RetouchPipeline:
     """逐图编排：去水印 → 填充 → 描边 → 回写。"""
@@ -111,6 +105,15 @@ class RetouchPipeline:
             result_relative_path = self._write_result_file(
                 image_record.job_id, image_record.seq, result_bytes
             )
+            # 放大失败整图 failed 不交付（2026-08-28 第十七次修订，用户定案
+            # "失败了就失败了"）：插值废图不产出——超分失败说明该图放大后
+            # 不可用，客户提示换更清晰原图比拿废图强（与去水印 failed 同构）
+            if stage_results.get("resize") == "failed":
+                self._mark_failed(
+                    image_record.image_id,
+                    "图片放大后清晰度不足，请提供更清晰的原图重试",
+                )
+                return
             elapsed_seconds = (utc_now() - process_start_timestamp).total_seconds()
             if elapsed_seconds > self._settings.image_process_timeout_seconds:
                 # 超时图不入成品（软超时兜底：步骤已完成但整体超预算也按失败）
@@ -198,12 +201,10 @@ class RetouchPipeline:
 
         stage_results: dict[str, str] = {}
         quality_hint = "none"
-        # 步骤开关（PT_STEPS_ENABLED）：未列步骤按 skipped 记档不执行（单步调试用）
-        enabled_steps = {
-            name.strip()
-            for name in self._settings.steps_enabled.split(",")
-            if name.strip()
-        }
+        # （2026-08-28 第二十次修订：PT_STEPS_ENABLED 步骤总闸已删——与各步
+        # 独立开关冗余且有"只改记档不拦截执行"前科。管线恒跑五步，每步
+        # 跑不跑由自身业务条件决定：没水印→skipped、非棋盘格→skipped、
+        # 未配 key→降级；单步调试用各步开关单开等价达成。）
 
         # ---- 双判定前移 + 合并调用（2026-08-26 定案）----
         # 在**原始图**上并行两问 qwen-vl：①有无水印 ②棋盘格背景。双 true 时
@@ -215,11 +216,7 @@ class RetouchPipeline:
         # 原始图问 VL 棋盘格：true → 填充先行（格子→纯白；白底不怕后续
         # 去水印的二次生成——本来就要它纯白）再去残留水印；false → 正常
         # 顺序（正常顺序下去水印会重绘棋盘格致填充判定失效，03:30 翻车）。
-        wm_first = not (
-            "watermark" in enabled_steps
-            and "fill" in enabled_steps
-            and self._is_checkerboard_image(image_bgr)
-        )
+        wm_first = not self._is_checkerboard_image(image_bgr)
         ordered_steps = ["watermark", "fill"] if wm_first else ["fill", "watermark"]
 
         for step_name in ordered_steps:
@@ -237,17 +234,19 @@ class RetouchPipeline:
                 fill_result = self._fill_step.run(image_bgr)
                 image_bgr = fill_result.image_bgr
                 stage_results["fill"] = fill_result.stage_value
-        if "watermark" not in enabled_steps:
-            stage_results["watermark"] = "skipped"
-        if "fill" not in enabled_steps:
-            stage_results["fill"] = "skipped"
 
         # 步 3：裁剪（CropStep，2026-08-26 独立 step）——按声明运行时执行：
         # 框裁外接区 + 形状掩膜塑形。原始域下框坐标有效；裁剪版域退化塑形。
-        from src.steps.crop import CropStep
+        # crop_enabled=false（2026-08-28 第二十次修订）→ 不裁框不塑形原图
+        # 直通，skipped 记档（下游形状描边/缩放形状重画随声明缺失自然退化）。
+        from src.steps.crop import CropStep, CropStepResult
 
-        crop_result = CropStep().run(image_bgr, crop_meta_for_crop)
-        image_bgr = crop_result.image_bgr
+        if self._settings.crop_enabled:
+            crop_result = CropStep().run(image_bgr, crop_meta_for_crop)
+            image_bgr = crop_result.image_bgr
+        else:
+            module_logger.info("crop: 配置关闭（PT_CROP_ENABLED=false）→ 原图直通")
+            crop_result = CropStepResult(image_bgr, "skipped")
         # 记档约定：crop 字段始终记声明 JSON（含 shape 供前端回显/排查），
         # 执行与否看 resize 等下游是否收到塑形图；无声明才记 "skipped"。
         # （2026-08-26 14:49 起 CropStep 对无框合法声明也执行塑形——
@@ -256,17 +255,10 @@ class RetouchPipeline:
         if crop_result.stage_value != "skipped":
             stage_results["crop_applied"] = crop_result.stage_value
 
-        # 步 4：描边（有裁剪形状声明 → 沿形状边界，见 outline.py 口径注）
-        if "outline" in enabled_steps:
-            outline_result = self._outline_step.run(image_bgr, crop_shape)
-            image_bgr = outline_result.image_bgr
-            stage_results["outline"] = outline_result.stage_value
-        else:
-            stage_results["outline"] = "skipped"
-
-        # 步 5：尺寸缩放（ResizeStep，2026-08-26 新增，管线最末——线宽像素
-        # 随缩放等比、打印物理毫米恒定）。按 crop_meta.size.cm 声明缩放到
-        # @300DPI 目标短边；放大走佐糖 scale-pro 变清晰（非裸插值）。
+        # 步 4：尺寸缩放（2026-08-28 第十九次修订前置——原步 5 提前：
+        # 描边必须在目标幅直画，避免佐糖定倍+尾程非常规倍率链拉伸灰线
+        # 导致锯齿与线宽物理漂移；见下方描边步注释）。按 crop_meta.size.cm
+        # 声明缩放到 @300DPI 目标短边；放大走佐糖 scale-pro 变清晰（非裸插值）。
         size_cm = None
         if crop_meta and isinstance(crop_meta.get("size"), dict):
             try:
@@ -286,21 +278,25 @@ class RetouchPipeline:
         # 常见蛋糕尺寸中档，3425 上限的 65%，小图硬拉上限无增益反费 API；
         # 已显式选尺寸的图上面 ResizeStep 已处理，不重复。提升不设 low-res
         # 提示（用户意志：自动处理好，不用提醒）。
-        from src.steps.resize.picwish_scale import PicwishScalePro
+        # （2026-08-28 第二十二次修订：auto-hd 自动变清晰已删——与前端
+        # "不设置（原图大小）"承诺矛盾（用户没选尺寸却被放大），且与佐糖
+        # 缩放启用逻辑不一致：缩放外呼只由用户显式选尺寸触发，不设置 =
+        # 严格原幅直通。2026-08-26 16:22 的自动提升定案就此撤销。）
 
-        auto_hd_available = PicwishScalePro(self._settings).is_configured()
-        if size_cm is None and auto_hd_available:
-            short_side_pixels = min(image_bgr.shape[0], image_bgr.shape[1])
-            if short_side_pixels < int(AUTO_HD_TARGET_SHORT_SIDE * 0.9):
-                module_logger.debug(
-                    "auto-hd: short=%d < %d → upscale to %dpx",
-                    short_side_pixels, int(AUTO_HD_TARGET_SHORT_SIDE * 0.9), AUTO_HD_TARGET_SHORT_SIDE,
-                )
-                auto_hd_result = ResizeStep(self._settings).run(
-                    image_bgr, AUTO_HD_SIZE_CM, resize_shape
-                )
-                image_bgr = auto_hd_result.image_bgr
-                stage_results["resize"] = auto_hd_result.stage_value
+        # 尾程提示聚合（2026-08-28）：resize 判定源图偏小（佐糖出幅 < 目标，
+        # 尾程稀释细节）→ 透传给前端显示"建议换更大图"（不阻塞交付）。
+        if resize_result.quality_hint == "suggest-larger-source":
+            quality_hint = "suggest-larger-source"
+
+        # 步 5：描边（2026-08-28 第十九次修订——管线最末步，目标幅直画：
+        # 线宽 px = mm×DPI/25.4 在交付幅精确落地，零拉伸零振铃；旧顺序
+        # [描边@源幅→缩放] 在佐糖服务端定倍 ×5.7+尾程 ×1.53 非常规倍率链下
+        # 灰线被拉出 LANCZOS 振铃锯齿 + 物理线宽漂 4 倍（2px→9.7px=0.82mm，
+        # 配置 0.2mm），心形真图实锤。白底判定与 rembg 分割随之在高幅跑，
+        # 分割质量更好，代价 rembg 大图耗时 +1-2s）。
+        outline_result = self._outline_step.run(image_bgr, crop_shape)
+        image_bgr = outline_result.image_bgr
+        stage_results["outline"] = outline_result.stage_value
 
         return encode_png(image_bgr), stage_results, quality_hint
 

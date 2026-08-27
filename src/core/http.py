@@ -38,15 +38,16 @@ _loop_start_lock = threading.Lock()
 def get_http_client(settings: PatternToolSettings) -> httpx.AsyncClient:
     """全局共享 AsyncClient（连接池复用；首次调用按配置初始化）。
 
-    超时取各调用场景的最大预算（生成式 40s/佐糖 110s 的包络）——细分
-    超时由调用方自行收紧，传输层只兜底。客户端本身线程安全（协程全在
-    循环线程上执行）。
+    超时取各调用场景的最大预算（生成式 40s/石榴去水印 60s/超分 30s 的
+    包络）——细分超时由调用方自行收紧，传输层只兜底。客户端本身线程
+    安全（协程全在循环线程上执行）。
     """
     global _async_client
     with _client_lock:
         if _async_client is None or _async_client.is_closed:
             max_read = max(float(settings.fill_gen_timeout_seconds),
-                          float(settings.wm_api_timeout_seconds), 30.0)
+                          float(settings.shiliu_timeout_seconds),
+                          float(settings.scale_timeout_seconds), 30.0)
             _async_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(read=max_read, connect=5.0, write=30.0, pool=5.0),
                 limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
@@ -82,15 +83,20 @@ def close_http_client() -> None:
 
 
 def _loop_thread_main(ready_event: threading.Event) -> None:
-    """循环线程主体：跑事件循环直至被 stop（协程的唯一执行域）。"""
+    """循环线程主体：跑事件循环直至被 stop（协程的唯一执行域）。
+
+    finally 用局部引用 close（2026-08-28 修复：close_http_client 停循环前
+    会先把全局 _loop 置 None，线程退出时读全局已是 None → AttributeError）。
+    """
     global _loop
-    _loop = asyncio.new_event_loop()
+    loop = asyncio.new_event_loop()
+    _loop = loop
     try:
-        asyncio.set_event_loop(_loop)
+        asyncio.set_event_loop(loop)
         ready_event.set()
-        _loop.run_forever()
+        loop.run_forever()
     finally:
-        _loop.close()
+        loop.close()
 
 
 def _ensure_loop_thread() -> asyncio.AbstractEventLoop:

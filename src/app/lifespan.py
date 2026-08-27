@@ -7,6 +7,7 @@
 - 创建归各自 core 模块（config.get_settings / database.get_db_connection /
   executor.get_image_executor / http.get_http_client 惰性建）；
 - 本模块只决定"何时"——启动 yield 前依次预热，退出 yield 后逆序释放；
+- 日志配置单例在启动段自动创建（core/logger.py，2026-08-27 第八次修订）；
 - TTL 清理线程与管线的启停同在此收口（与库连接同生命周期）。
 """
 
@@ -18,6 +19,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from src.core.config import PatternToolSettings, get_settings
+from src.core.logger import configure_logging
 from src.jobs.ttl import TTLCleaner
 
 module_logger = logging.getLogger("pattern_tool.lifespan")
@@ -28,6 +30,10 @@ async def lifespan(app: FastAPI):
     """启动：预热数据库连接 + 图片处理线程池 + TTL 恢复扫描；
     退出：逆序停清理线程 → 关管线 → 关线程池 → 关库连接 → 关 HTTP 客户端。"""
     settings: PatternToolSettings = getattr(app.state, "settings", None) or get_settings()
+
+    # 日志单例自动创建（2026-08-27 第八次修订）：启动时配好控制台/文件双通道
+    # （入口在此不在 main.py；幂等，测试逐 test 重建 app 时替换旧 handler）。
+    configure_logging(settings)
 
     # ---- 启动段（yield 前）：初始化 ----
     from src.core.database import get_db_connection

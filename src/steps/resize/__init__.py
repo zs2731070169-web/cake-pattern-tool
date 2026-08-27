@@ -5,4 +5,4 @@ from src.steps.resize.resize import (
     SIZE_CM_MIN,
     target_short_side_pixels,
 )
-from src.steps.resize.picwish_scale import PicwishScalePro, SCALE_PRO_MAX_SIDE
+from src.steps.resize.picwish_scale import PicwishScalePro

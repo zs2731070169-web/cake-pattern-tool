@@ -12,11 +12,11 @@
 
 | 步骤 | 做什么 | 关键口径 |
 |---|---|---|
-| 去水印 | qwen-vl 语义预检判有无（~¥0.003/次）→ 有才调佐糖 PicWish 高级版修复 | 判无 skipped 零外呼；修复失败（欠费/超时）原图零误伤交付，记 failed 前端红显 |
+| 去水印 | qwen-vl 语义预检判有无（~¥0.003/次）→ 有才调石榴智能高级版修复（异步提交+轮询，唯一供应商） | 判无 skipped 零外呼；修复失败（欠费/超时）原图零误伤交付，记 failed 前端红显 |
 | 填充 | qwen-vl 判棋盘格背景 → qwen-image-2.0 生成式换纯白底 | 非棋盘格（白底/照片）skipped 零外呼；结果缓存同图免重复计费；生成失败原图交付记 failed |
 | 裁剪 | 按前端声明（形状+框）运行时执行：框裁外接区 + 形状掩膜塑形（形状外 alpha=0） | 前端只声明不裁像素；默认矩形整图；同图切形状零重复外呼 |
 | 描边 | 白底判定 → rembg 图案分割 → 形状边界内缩灰线（1.5mm@300DPI 打印裁切参考线） | 非白底 skipped；rembg 不可用退灰度阈值法 |
-| 尺寸缩放 | 按打印尺寸档（4/6/8/10/12 寸 + 自定义 cm）缩放到 @300DPI 目标短边；未选尺寸的小图自动超分到 8 寸档 | 缩小本地 INTER_AREA；放大优先佐糖 scale-pro 超分，失败插值兜底记 done(interpolated) 前端红显 |
+| 尺寸缩放 | 按打印尺寸档（4/6/8/10/12 寸 + 自定义 5-33cm，上限=打印机 A3+ 幅面）缩放到 @300DPI 目标短边 | 缩小本地 INTER_AREA；放大走佐糖 scale-pro 高级变清晰（sync=0 异步，服务端定倍）；失败记 failed 前端红显不交付 |
 
 管线全程**原始域**处理（同图不同形状共享全部缓存与模型外呼）；棋盘格图自动换序
 先填充再去水印（避免去水印重绘格子致填充判定失效）。
@@ -29,7 +29,7 @@
 - **后端**：Python 3.11/3.12 · FastAPI · uvicorn（worker=1，SQLite 单写者前提）· OpenCV · rembg
 - **存储**：SQLite（WAL，两表：`process_jobs` / `job_images`，DDL 在 `db/schema.sql` 启动自动执行）+ 本机文件系统（原图/结果 PNG，TTL 24h 自动清理）
 - **前端**：无构建链原生 HTML/CSS/JS 单页（cropper.js 裁剪交互），同进程静态挂载
-- **外部 API**：阿里云百炼（qwen-vl 判定 / qwen-image 换白）、佐糖 PicWish（去水印 / 超分）——全部可配置开关，未配 key 时对应步骤零误伤跳过
+- **外部 API**：阿里云百炼（qwen-vl 判定 / qwen-image 换白）、石榴智能（去水印）、佐糖 PicWish（scale-pro 超分变清晰）——全部可配置开关，未配 key 时对应步骤零误伤跳过
 
 ```
 src/
@@ -73,10 +73,13 @@ docs/plan/        # 技术方案文档（口径真源，改代码先改文档）
 | 变量 | 说明 | 默认 |
 |---|---|---|
 | `PT_PORT` | 监听端口 | 8200 |
-| `PT_DATA_DIR` | 数据根目录（库+图片+缓存） | data |
-| `PT_STEPS_ENABLED` | 启用的管线步骤（逗号分隔，单步调试用） | watermark,fill,crop,outline,resize |
-| `PT_WM_PRECHECK_KEY` / `PT_WM_API_KEY` | 百炼 VL 预检 / 佐糖去水印+超分 API Key | 空（未配则对应步跳过） |
+| `PT_DATA_DIR` | 数据根目录（库+图片+缓存+日志） | data |
+| `PT_LOG_LEVEL` | 控制台日志级别 | INFO |
+| `PT_LOG_FILE_LEVEL` | 文件日志级别（`{data_dir}/logs/app.log`，10MB×5 轮转） | DEBUG |
+| `PT_WM_PRECHECK_KEY` / `PT_SHILIU_API_KEY` | 百炼 VL 预检 / 石榴去水印 Key | 空（未配则对应步跳过） |
+| `PT_PICWISH_API_KEY` | 佐糖 scale-pro 变清晰 Key | 空（未配则放大 failed） |
 | `PT_FILL_GEN_KEY` | 百炼 qwen-image 换白底 Key | 空（未配则填充跳过） |
+| `PT_CROP_ENABLED` | 是否执行声明式裁剪（关 = 原图直通不塑形） | true |
 | `PT_OUTLINE_WIDTH_MM` | 描边线宽（毫米） | 1.5 |
 | `PT_JOB_TTL_HOURS` | 批次保留时长 | 24 |
 

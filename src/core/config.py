@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 项目根目录（src/core/ 的上两级），.env 与 data/ 都相对它定位
@@ -26,6 +27,17 @@ class PatternToolSettings(BaseSettings):
     # ---- 服务 ----
     port: int = 8200  # 监听端口（uvicorn :8200）
     data_dir: str = "data"  # 数据库与批次图片根目录（相对项目根）
+    log_level: str = "INFO"  # 控制台日志级别（DEBUG/INFO/WARNING/ERROR/CRITICAL）
+    log_file_level: str = "DEBUG"  # 文件日志级别（data/logs/app.log 持久化通道，排障主径全量落盘）
+
+    @field_validator("log_level", "log_file_level")
+    @classmethod
+    def _validate_log_level(cls, value: str) -> str:
+        """日志级别规范化：大小写不敏感 + 拒绝非法值（fail-fast，不带错配跑）。"""
+        normalized = value.upper()
+        if normalized not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError(f"非法日志级别: {value}")
+        return normalized
 
     # ---- 上传校验 ----
     max_images_per_job: int = 9  # 单批图片张数上限（1-9）
@@ -42,7 +54,6 @@ class PatternToolSettings(BaseSettings):
     image_process_timeout_seconds: int = 180  # 单图处理时长上限（只计 processing 段；佐糖 110s + 生成式换底 40s + 描边 ~10s 最坏和——佐糖回退后恢复 180，2026-08-26）
     image_queue_timeout_seconds: int = 600  # 排队时长上限，超时置 failed 提示错峰
     max_concurrent_processing: int = 0  # 全局同时 processing 图上限（0 = 自动 2×CPU 核数）
-    steps_enabled: str = "watermark,outline"  # 启用的管线步骤（fill 默认移除——白区归属像素层面不可分；v16 生成式路径就绪后启用走 .env：watermark,fill,outline）
 
     # ---- TTL ----
     job_ttl_hours: int = 24  # 批次保留时长（小时），过期清理文件与记录
@@ -71,11 +82,21 @@ class PatternToolSettings(BaseSettings):
     # PT_WM_SIMPLE_AREA_RATIO / PT_WM_DETECT_CONFIDENCE / PT_WM_DIFF_THRESHOLD /
     # PT_WM_PLATFORM_KEYWORDS 残留配置会被 extra=ignore 忽略）
 
-    # ---- 去水印修复：佐糖 PicWish 高级版（2026-08-26 回退恢复主力——当日曾
-    #      换 qwen-image 生成式，多图实测整体效果不理想，用户定案回退）----
-    wm_api_enabled: bool = False  # 是否启用佐糖档
-    wm_api_key: str = ""  # 佐糖 X-API-KEY，绝不进前端/日志/错误信息
-    wm_api_timeout_seconds: int = 110  # 佐糖等待上限（秒）——同步等待至完成
+    # ---- 去水印修复：石榴智能高级版唯一供应商（2026-08-27 第十次修订——佐糖
+    #      完全下线，wm_provider 开关删除；成本对比见 docs/cost/）----
+    wm_api_enabled: bool = False  # 是否启用修复外呼（关 = 检出也不修，skipped 原图）
+    shiliu_api_key: str = ""  # 石榴智能 APIKEY（header 名字面量 APIKEY；去水印+超分共用积分池），绝不进前端/日志/错误信息
+    shiliu_timeout_seconds: int = 60  # 石榴去水印异步提交+轮询预算（秒）——async_fetch 3s 间隔轮询至上限
+
+    # ---- 裁剪步（2026-08-28 第二十次修订补配置——五步齐备各步独立开关）----
+    crop_enabled: bool = True  # 是否执行声明式裁剪（关 = 不裁框不塑形原图直通，skipped 记档）
+
+    # ---- 超分放大：供应商开关（2026-08-28 第十八次修订——佐糖充值复活，
+    #      picwish|shiliu 可切；石榴历版目检不符合预期，超分主力回佐糖）----
+    picwish_api_key: str = ""  # 佐糖 X-API-KEY（scale-pro 变清晰；与去水印键独立——去水印已切石榴）
+    picwish_timeout_seconds: int = 110  # 佐糖任务等待上限（秒，提交-轮询-下载全程）
+    scale_enabled: bool = False  # 是否启用超分外呼（关 = 放大记 failed 不交付）
+    scale_timeout_seconds: int = 30  # 石榴超分预算（秒）；佐糖走 picwish_timeout_seconds
 
     # ---- 去水印段 2：qwen-vl 语义预检（4.4 v3 三段链路）----
     wm_precheck_enabled: bool = False  # OpenCV 零检出图走 VL 预检（判有才调佐糖）

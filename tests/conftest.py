@@ -16,6 +16,19 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from src.app.main import create_app  # noqa: E402
 from src.core.config import PatternToolSettings  # noqa: E402
+from src.core.logger import configure_logging  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def isolated_logging(test_settings: PatternToolSettings):
+    """逐 test 把日志双通道兜底重配到 tmp data_dir（autouse）。
+
+    日志单例在 lifespan 启动段自动创建（用 api_client 的用例已在 TestClient
+    启动时指向 tmp）；本夹具兜住不用 api_client 的用例与收集后残留，确保
+    任何测试日志不写进真实 data/logs/。configure_logging 幂等替换，无叠加。
+    """
+    configure_logging(test_settings)
+    yield
 
 
 @pytest.fixture()

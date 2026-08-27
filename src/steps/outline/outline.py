@@ -298,6 +298,20 @@ def draw_shape_outline(
     hard_opaque = image_bgra[:, :, 3] == 255
     usable = hard_opaque if hard_opaque.mean() > 0.5 else opaque_mask(image_bgra)
 
+    # 形状外颜色清洗（2026-08-28 第二十一次修订）：放大链（佐糖定倍+LANCZOS
+    # 尾程）会把图案颜色边缘外渗越过解析形状边界数 px——线沿解析边界画却
+    # 被渗出颜色"绕过"（用户真图实锤：隔离带出现 134-191 深色图案内容）。
+    # 画线前把解析掩膜外的颜色像素洗白，恢复线-边界隔离带；与 resize 内
+    # alpha 解析重画同构（形状内图案无损，只清渗出伪影）。
+    if shape_value not in RECTANGLE_LIKE_SHAPES:
+        outside = ~shape_mask
+        bleed = outside & (image_bgra[:, :, :3] < 248).any(axis=2)
+        if bleed.any():
+            image_bgra[:, :, :3][bleed] = 255
+            module_logger.debug(
+                "outline: 形状外颜色清洗 %d px（放大链渗出伪影）", int(bleed.sum())
+            )
+
     if shape_value in RECTANGLE_LIKE_SHAPES:
         # 矩形类：形状区域=整个画布，"区域−内缩"求边界带的通式对全图掩膜失效
         # （全图腐蚀仍全图→空带），直接构造四条边框带；内缩一个线宽防打印裁边。

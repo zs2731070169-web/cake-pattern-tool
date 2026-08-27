@@ -4,15 +4,16 @@
 （生产经 Nginx 反代 HTTPS，见技术方案 7.1 反代三条口径）
 
 装配职责（2026-08-26 重构定稿）：
-- main.py：应用创建 + 中间件 + 路由 include + 静态前端挂载 + 日志配置；
+- main.py：应用创建 + 中间件 + 路由 include + 静态前端挂载；
 - api.py：APIRouter 接口声明（无 app 无中间件）；
 - deps.py：FastAPI 依赖注入；
 - lifespan.py：core 单例初始化/关闭（生命周期机制）。
+
+日志不在本模块配置（2026-08-27 第八次修订）：src/core/logger.py 的双通道
+（控制台 + data/logs/app.log 轮转）由 lifespan 启动段自动创建，见该模块。
 """
 
 from __future__ import annotations
-
-import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,24 +24,6 @@ from src.app.lifespan import lifespan
 from src.core.config import PROJECT_ROOT_DIR, PatternToolSettings
 from src.jobs.pipeline import RetouchPipeline
 from src.jobs.store import JobStore
-
-# 结构化日志基础配置：不记图片内容（6 节观测口径）。
-# 去水印与填充生成式链路（检测/预检/佐糖/缓存/触发门/验证门）是线上
-# 排障主径，提到 DEBUG；其余 INFO。
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
-logging.getLogger("pattern_tool.watermark").setLevel(logging.DEBUG)
-logging.getLogger("pattern_tool.watermark.precheck").setLevel(logging.DEBUG)
-logging.getLogger("pattern_tool.watermark.picwish").setLevel(logging.DEBUG)
-logging.getLogger("pattern_tool.watermark.cache").setLevel(logging.DEBUG)
-logging.getLogger("pattern_tool.fill.filling").setLevel(logging.DEBUG)
-logging.getLogger("pattern_tool.fill.qwenbg").setLevel(logging.DEBUG)
-logging.getLogger("pattern_tool.fill.cache").setLevel(logging.DEBUG)
-# 第三方 HTTP 库请求日志降噪（佐糖轮询 2s 一次/生成式外呼会刷屏 INFO；
-# 业务语义日志已由各 step 的 debug 打点覆盖——含耗时与轮询结果）
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def create_app(

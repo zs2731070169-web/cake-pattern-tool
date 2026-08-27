@@ -1,10 +1,10 @@
-"""去水印步：qwen-vl 检测 + 佐糖 PicWish 修复（技术方案 4.4 / 5.2 图 B）。
+"""去水印步：qwen-vl 检测 + 石榴智能修复（唯一供应商）（技术方案 4.4 / 5.2 图 B）。
 
 - 检测：qwen-vl-plus 语义预检（唯一检测器，~¥0.003/次；OpenCV 检测
   2026-08-25 退役——实测 2/4 错且两方向都错）判有才修；
-- 修复：佐糖 PicWish 高级版全屏自动去水印（2026-08-26 回退恢复主力——
-  当日曾换 qwen-image-2.0 生成式，多图实测整体效果不理想，用户定案回退；
-  10 算粒/次，同步等待至完成 110s 上限）；缓存优先（原始域键，同图免计费）；
+- 修复：石榴智能高级版（2026-08-27 第十次修订：佐糖完全下线，供应商
+  路由撤销——佐糖仅存 resize 步超分职责；成本对比 docs/cost/）；异步
+  提交+轮询 ≤60s；缓存优先（原始域键，同图免计费）；
 - 修复失败/未配 → 原图 + heavy-watermark 提示（零误伤）。
 """
 
@@ -19,7 +19,7 @@ from src.core.config import PatternToolSettings
 from src.steps.imaging import ensure_bgra, flatten_to_white
 from src.steps.watermark.cache import WatermarkResultCache
 from src.steps.watermark.precheck import WatermarkPrecheck
-from src.steps.watermark.picwish import PicwishWatermarkRemover
+from src.steps.watermark.shiliu import ShiliuWatermarkRemover
 
 module_logger = logging.getLogger("pattern_tool.watermark")
 
@@ -43,8 +43,11 @@ class WatermarkStepResult:
 # （2026-08-25 退役存档）OpenCV 检测源（RapidOCR 文字框 ∪ 频域邻域差分
 # 小块的 detect_watermark_mask 与 OCR 引擎缓存）已删除——实测判定 2/4 错且
 # 两方向都错（无水印图差分误触发、浅水印漏检），qwen-vl 语义预检 4/4 全对
-# 成为唯一检测器（4.4 v5）；佐糖退役（2026-08-26）后连"平台水印走二级"
-# 的分流职能也一并消失。git 历史可溯。
+# 成为唯一检测器（4.4 v5）。
+# （2026-08-27 第十次修订存档）佐糖去水印客户端 watermark/picwish.py 已删
+# （成本 4~6 倍于石榴，供应商路由与 PT_WM_PROVIDER 开关一并撤销）；第十一次
+# 修订佐糖超分客户端 picwish_scale.py 亦删——佐糖全面退出，回退需从 git
+# 历史恢复客户端。git 历史可溯。
 
 
 class WatermarkStep:
@@ -52,7 +55,7 @@ class WatermarkStep:
 
     def __init__(self, settings: PatternToolSettings) -> None:
         self._settings = settings
-        self._picwish = PicwishWatermarkRemover(settings)
+        self._shiliu = ShiliuWatermarkRemover(settings)
         self._cache = WatermarkResultCache(settings)
         self._precheck = WatermarkPrecheck(settings)
 
@@ -62,12 +65,11 @@ class WatermarkStep:
         original_bgr: np.ndarray | None = None,
         crop_meta_json: str | None = None,
     ) -> WatermarkStepResult:
-        """去水印（4.4 v2，2026-08-26 换装）；算法异常由管线捕获转 failed。
+        """去水印（4.4，2026-08-27 第十次修订）；算法异常由管线捕获转 failed。
 
         检测：qwen-vl 语义预检（唯一检测器，~¥0.003/次）判有才修。
-        修复降级链：缓存（原始域键）→ **佐糖 PicWish 高级版（2026-08-26
-        回退恢复——qwen-image 换装当日实测整体效果不理想）** → 原图 +
-        heavy-watermark（零误伤）。
+        修复降级链：缓存（原始域键）→ 石榴智能高级版（唯一供应商，
+        异步提交+轮询 ≤60s；佐糖已下线）→ 原图 + heavy-watermark（零误伤）。
         预检未配/失败/判无 → skipped 原图（不盲修，零误伤）。
         """
         image_bgra = ensure_bgra(image_ndarray)
@@ -92,7 +94,7 @@ class WatermarkStep:
             module_logger.info("watermark → skipped（无水印信号，零外呼）")
             return WatermarkStepResult(image_ndarray, "skipped")
 
-        # ---- 修复：缓存优先（原始域键），主力 qwen-image，佐糖兜底 ----
+        # ---- 修复：缓存优先（原始域键），石榴唯一供应商（第十次修订）----
         cached = self._cache.get(analysis_bgr)
         module_logger.debug("cache hit=%s", cached is not None)
         if cached is not None:
@@ -100,16 +102,16 @@ class WatermarkStep:
             return self._merge_repaired_result(image_bgra, repaired_cropped, "done(api)", "none", is_heavy)
 
         repaired = None
-        # 修复：佐糖 PicWish 高级版（2026-08-26 回退恢复主力）
-        module_logger.debug("picwish configured=%s", self._picwish.is_configured())
-        if self._picwish.is_configured():
-            module_logger.info("watermark: 检出水印 → 佐糖修复外呼中…")
-            repaired = self._picwish.remove_watermark(analysis_bgr)
+        module_logger.debug("shiliu configured=%s", self._shiliu.is_configured())
+        if self._shiliu.is_configured():
+            module_logger.info("watermark: 检出水印 → 石榴修复外呼中…")
+            repaired = self._shiliu.remove_watermark(analysis_bgr)
             module_logger.info(
-                "watermark: 佐糖修复%s", "成功" if repaired is not None else "失败（欠费/超时——原样交付记 failed）"
+                "watermark: 石榴修复%s",
+                "成功" if repaired is not None else "失败（欠费/超时——原样交付记 failed）",
             )
         else:
-            module_logger.warning("watermark: 检出水印但佐糖未配置 → failed 原样交付")
+            module_logger.warning("watermark: 检出水印但石榴未配置 → failed 原样交付")
 
         if repaired is not None:
             self._cache.put(analysis_bgr, repaired)
@@ -163,7 +165,7 @@ class WatermarkStep:
     ) -> WatermarkStepResult:
         """修复结果（3 通道 BGR）与本地透明通道合并：颜色取修复图，alpha 取本地。
 
-        佐糖返回的是不透明 JPG——透明=打印不印的语义由本地 alpha 保住。
+        石榴返回的是不透明 JPG——透明=打印不印的语义由本地 alpha 保住。
         尺寸不一致时以区域缩放回原幅。
         """
         if repaired_bgr.shape[:2] != image_bgra.shape[:2]:

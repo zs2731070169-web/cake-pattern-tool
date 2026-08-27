@@ -21,7 +21,7 @@ module_logger = logging.getLogger("pattern_tool.ttl")
 RESTART_INTERRUPTED_MESSAGE = "服务重启中断，请重新提交"
 
 # API 结果缓存目录清单（新增外部 API 缓存在此登记，统一随批次 24h 清理）
-_CACHE_DIR_NAMES = ("watermark", "fill_gen")
+_CACHE_DIR_NAMES = ("watermark", "fill_gen", "scale")
 
 
 class TTLCleaner:

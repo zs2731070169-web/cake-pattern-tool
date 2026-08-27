@@ -93,3 +93,43 @@ def test_client_rebuild_after_close(thread_settings: PatternToolSettings) -> Non
         assert not second.is_closed
     finally:
         close_http_client()
+
+
+def test_close_during_active_poll_no_thread_crash():
+    """关停竞态回归（2026-08-28 修复）：处理中（协程在途）关停——循环线程
+    finally 引用全局 _loop 时已被 close_http_client 置 None，旧实现抛
+    AttributeError 'NoneType' object has no attribute 'close'。局部引用修复后
+    关停全程无异常。"""
+    import asyncio
+    import threading
+    import time as time_module
+
+    from src.core.http import _ensure_loop_thread
+
+    close_http_client()  # 复位
+
+    settings = PatternToolSettings(data_dir="/tmp/http-race", _env_file=None)
+    client = get_http_client(settings)
+
+    release = threading.Event()
+    started = threading.Event()
+
+    async def hanging():
+        started.set()
+        await release.wait(timeout=5)
+        return None
+
+    def submitter():
+        # 协程提交进循环线程并挂起——模拟外呼在途
+        future = asyncio.run_coroutine_threadsafe(hanging(), _ensure_loop_thread())
+        future.result(timeout=5)
+
+    worker = threading.Thread(target=submitter)
+    worker.start()
+    assert started.wait(timeout=5)
+    time_module.sleep(0.1)
+
+    close_http_client()  # 处理中关停（旧实现此处触发线程 crash）
+    release.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()

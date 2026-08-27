@@ -83,15 +83,17 @@ kill_port_occupant() {
   sleep 0.5
 }
 
-# 启动前清空 data/ 运行时数据（批次文件、SQLite 库、去水印缓存）——重启即全新状态。
-# 用途：调试期避免旧数据/旧缓存干扰；生产环境若要保留数据（TTL 自动清理），
+# 启动前清理 data/ 运行时数据（批次文件、SQLite 库、API 结果缓存）——重启即全新状态。
+# data/logs/ 豁免：崩溃后重启正是最需要日志的时刻，日志靠轮转封顶防增长。
+# 显式枚举而非整目录删除（2026-08-27 第八次修订）：误删面最小，与 ttl.py
+# _CACHE_DIR_NAMES 登记口径一致；生产环境若要保留数据（TTL 自动清理），
 # 注释掉 run 分支里的 clear_runtime_data 调用即可。
 clear_runtime_data() {
   local data_dir
   data_dir="${PROJECT_ROOT}/data"
   if [ -d "$data_dir" ]; then
-    log "清空运行时数据：${data_dir}（批次/数据库/缓存）"
-    rm -rf "$data_dir"
+    log "清理运行时数据：${data_dir}（批次/数据库/缓存，保留 logs）"
+    rm -rf "$data_dir/jobs" "$data_dir/cache" "$data_dir"/pattern_tool.db*
   fi
 }
 
