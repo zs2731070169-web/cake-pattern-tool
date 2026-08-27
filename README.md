@@ -99,3 +99,34 @@ docs/plan/        # 技术方案文档（口径真源，改代码先改文档）
 
 - [`docs/plan/修图工具最小技术方案.md`](docs/plan/修图工具最小技术方案.md) — 模块技术设计唯一真源（需求口径、ER 图、接口契约、修订记录）；**改代码先改文档**
 - [`docs/deploy/部署文档.md`](docs/deploy/部署文档.md) — 生产部署（systemd 常驻 + Nginx 反代 + HTTPS 证书）
+- [`AGENTS.md`](AGENTS.md) — AI 编码助手工程约定
+- [`openspec/specs/`](openspec/specs/) — OpenSpec 行为规格（按核心功能划分，见下表）
+
+| 规格域 | 说明 |
+|--------|------|
+| **[architecture](openspec/specs/architecture/spec.md)** | **整体架构（单体部署、分层模块、请求链路、并发模型、非功能约束）** |
+| [pipeline](openspec/specs/pipeline/spec.md) | 管线编排、顺序门、记档语义 |
+| [watermark](openspec/specs/watermark/spec.md) | 去水印（VL 预检 + 佐糖修复） |
+| [fill](openspec/specs/fill/spec.md) | 背景填充（棋盘格 + 换白） |
+| [crop](openspec/specs/crop/spec.md) | 声明式裁剪 |
+| [outline](openspec/specs/outline/spec.md) | 描边 |
+| [resize](openspec/specs/resize/spec.md) | 尺寸缩放与超分 |
+| [job-api](openspec/specs/job-api/spec.md) | 批次 HTTP 接口与限流 |
+| [frontend](openspec/specs/frontend/spec.md) | 前端交互与交付 |
+| [storage](openspec/specs/storage/spec.md) | SQLite、文件存储、TTL |
+
+## OpenSpec 规格驱动开发
+
+本项目使用 [OpenSpec](https://openspec.dev) 管理需求变更。Cursor 中可用 `/opsx:*` 命令：
+
+| 命令 | 说明 |
+|------|------|
+| `/opsx:explore` | 探索需求与方案 |
+| `/opsx:propose "变更名"` | 创建变更提案 |
+| `/opsx:apply` | 按 tasks 实现 |
+| `/opsx:sync` | 同步规格与代码 |
+| `/opsx:archive` | 归档已完成变更 |
+
+```bash
+npx @fission-ai/openspec validate --specs   # 校验规格格式
+```

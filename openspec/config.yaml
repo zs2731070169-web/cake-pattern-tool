@@ -1,0 +1,60 @@
+schema: spec-driven
+
+context: |
+  项目名称：cake-pattern-tool（糯米纸图案自动化修图工具）
+  领域：C 端自助修图；蛋糕糯米纸图案去水印、背景填充、裁剪、描边、尺寸缩放
+
+  技术栈：
+  - 后端：Python 3.11/3.12 · FastAPI · uvicorn（worker=1）· OpenCV · rembg
+  - 存储：SQLite（WAL，process_jobs / job_images）+ 本地文件系统（TTL 24h）
+  - 前端：原生 HTML/CSS/JS 单页（cropper.js），同进程 StaticFiles 挂载
+  - 外部 API：阿里云百炼（qwen-vl / qwen-image）、佐糖 PicWish（去水印 / 超分）
+
+  文档层级：
+  - openspec/specs/ — OpenSpec 行为规格（变更提案的增量真源）
+  - docs/plan/修图工具最小技术方案.md — 模块技术设计（改代码先改文档）
+  - docs/spec/SKILL.md — 开发规范（最小闭环、防御性编程）
+  - AGENTS.md — AI 工程约定
+
+  规格域（architecture 为整体架构入口，其余按核心功能划分）：
+  - architecture — 整体架构（单体部署、分层模块、请求链路、并发模型、非功能约束、子域索引）
+  - pipeline — 管线编排（顺序门、原始域、记档语义、批内隔离）
+  - watermark — 去水印（qwen-vl 预检 + 佐糖修复 + 缓存）
+  - fill — 背景填充（棋盘格判定 + qwen-image 换白）
+  - crop — 声明式裁剪（CropStep 运行时塑形）
+  - outline — 描边（白底判定 + 形状边界灰线）
+  - resize — 尺寸缩放（打印档 + 佐糖超分）
+  - job-api — 批次接口（建批/轮询/下载/限流/校验）
+  - frontend — 前端交互（双栏布局、上传裁剪、分端交付）
+  - storage — 存储与 TTL（SQLite、文件、缓存、清理）
+
+  架构要点：
+  - 五步管线：watermark → fill → crop → outline → resize（棋盘格图顺序换为 fill → watermark）
+  - 原始域处理：同图不同形状共享缓存与模型外呼
+  - stage_results：done / done(api) / done(interpolated) / skipped / failed
+  - 线程模型：管线跑 ThreadPoolExecutor；HTTP 走 http_sync 唯一后台事件循环
+  - 配置入口：PatternToolSettings（PT_ 前缀），.env.example 三处同步
+
+  语言与沟通：
+  - 文档与 AI 回复使用中文
+  - 代码标识符、API、文件名使用英文
+
+rules:
+  proposal:
+    - 必须包含 Intent（意图）、Scope（范围）、Approach（方案）
+    - 明确 Non-goals（非目标），避免范围蔓延
+    - 引用 docs/plan 相关章节，说明与现有口径的对齐或修订
+  specs:
+    - 使用 ADDED / MODIFIED / REMOVED 增量格式
+    - 每个 Requirement 至少包含一个 Scenario
+    - Scenario 使用 GIVEN / WHEN / THEN 格式
+    - 管线步骤变更须覆盖 skipped / failed 语义与零误伤交付
+  design:
+    - 说明关键架构决策及取舍理由
+    - 复杂流程需有序列或流程说明
+    - 改表结构先改 db/schema.sql，再动 src/jobs/store.py
+    - 涉及模块边界或部署模型变更时同步更新 architecture spec
+  tasks:
+    - 任务拆分为可独立验证的小块
+    - 每项任务对应可勾选的 checkbox
+    - 跨文件改动须列出最小回归测试方案
