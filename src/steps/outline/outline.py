@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 
 import cv2
@@ -245,6 +246,44 @@ def draw_outline(
 
 RECTANGLE_LIKE_SHAPES = {"square", "rectangle", "rectangle-fixed", "free"}
 KNOWN_CROP_SHAPES = RECTANGLE_LIKE_SHAPES | {"circle", "heart", "star"}
+
+# 形状包围盒宽高比（第三十六次修订）——与前端 app.js SHAPE_ASPECT_RATIOS 同源
+# （裁剪弹层的框宽高比锁定值），改形状公式必须两端同改。
+SHAPE_BOX_ASPECT_RATIOS = {
+    "circle": 1.0,
+    "square": 1.0,
+    "rectangle-fixed": 1.5,
+    "heart": 32.0 / 28.9,
+    "star": 1.902 / 1.809,
+}
+
+
+def _round_half_up(value: float) -> int:
+    """四舍五入（半向上）——与前端 Math.round 同口径（第三十六次修订补：
+    Python round 是银行家舍入，k+0.5 落点与 JS 差 1px，同源公式须同舍入）。"""
+    return int(math.floor(value + 0.5))
+
+
+def default_shape_box(width: int, height: int, shape_value: str) -> tuple[int, int, int, int]:
+    """无框形状声明的默认框（第三十六次修订）：图内居中最大的形状包围盒宽高比
+    矩形 (left, top, box_w, box_h)——与单独裁剪弹层默认框（autoCropArea=1 +
+    宽高比锁定）同几何：无框统一形状 ≡ 打开弹层选形状不动框直接确认。
+    rectangle/free 无默认框语义（整图直通），返回整图框。
+    """
+    aspect = SHAPE_BOX_ASPECT_RATIOS.get(shape_value)
+    if aspect is None or width < 1 or height < 1:
+        return 0, 0, width, height
+    if width / height >= aspect:
+        box_height = height
+        box_width = _round_half_up(height * aspect)
+    else:
+        box_width = width
+        box_height = _round_half_up(width / aspect)
+    box_width = min(box_width, width)
+    box_height = min(box_height, height)
+    left = (width - box_width) // 2
+    top = (height - box_height) // 2
+    return left, top, box_width, box_height
 
 
 def crop_shape_region_mask(shape_value: str, width: int, height: int) -> np.ndarray:

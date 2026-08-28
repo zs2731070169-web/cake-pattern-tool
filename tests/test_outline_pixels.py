@@ -259,13 +259,17 @@ def test_crop_shape_square_draws_border_frame(api_client: TestClient):
     assert not gray_line[120:216, 120:216].any(), "中心区出现灰线"
 
 
-def test_batch_shape_square_rectfixed_nobox_shapes_image(api_client: TestClient):
+def test_batch_shape_square_rectfixed_nobox_shapes_image(api_client: TestClient, test_settings):
     """第二十九次修订核心回归：批级无框 square/rectangle-fixed 声明真实塑形
-    （用户实锤"长方形和正方形设置不到图案上去"——旧矩形类一律整图直通，
-    实测输出 0 像素变化）。400 高×300 宽画布：
-    - square：min 边=300 → 居中 300×300 正方形，上下各 ~50px 透明带；
-    - rectangle-fixed：3:2 横向最大化=300×200 居中，上下各 ~100px 透明带。"""
-    for shape_value in ("square", "rectangle-fixed"):
+    （用户实锤"长方形和正方形设置不到图案上去"）。第三十六次修订：无框=
+    形状默认框（图内居中最大形状包围盒宽高比框，与单独裁剪默认框同几何）。
+    400 高×300 宽画布：
+    - square：框=300×300 居中（上下各裁 50px）→ 满幅不透明；
+    - rectangle-fixed：框=300×200 居中（上下各裁 100px）→ 3:2 满幅不透明。"""
+    from src.steps.outline import outline_width_pixels
+
+    ring_pad = 2 * outline_width_pixels(test_settings)  # 描边外环画布外扩（勿硬编码——线宽配置可变）
+    for shape_value, box_h in (("square", 300), ("rectangle-fixed", 200)):
         canvas = np.full((400, 300, 3), 255, dtype=np.uint8)
         cv2.circle(canvas, (150, 200), 60, (60, 140, 60), -1)
         response = api_client.post(
@@ -290,18 +294,14 @@ def test_batch_shape_square_rectfixed_nobox_shapes_image(api_client: TestClient)
             np.frombuffer(download.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED
         )
         assert result_bgra.shape[2] == 4, "塑形交付应带 alpha 通道"
-        # 第三十五次修订（补方后满幅）：无框 square/rectangle-fixed 在补方画布
-        # （max 边正方形）上满幅内接——square=整幅不透明、rectangle-fixed=3:2
-        # 居中（原 300 宽画布 max=400 → 补方 400×400）
+        # 输出幅=默认框幅 300×box_h + 描边外环 2×18px（白底 → outline done）；
+        # 框比例=形状包围盒比例 → 掩膜撑满框，整幅近满不透明（无补方透明带/
+        # 黑边——三十五次补方满幅退役）
         alpha = result_bgra[:, :, 3]
-        assert result_bgra.shape[:2] == (400, 400), f"应补方到 400x400，实际 {result_bgra.shape[:2]}"
-        if shape_value == "square":
-            assert (alpha > 200).mean() > 0.95, "square 补方后应近满幅不透明"
-        else:
-            # rectangle-fixed 3:2 满幅：400 宽 × 267 高居中，上下各 ~66px 透明
-            assert (alpha[:60, :] < 10).all(), "rectangle-fixed 顶部未透明（3:2 未生效）"
-            assert (alpha[-60:, :] < 10).all(), "rectangle-fixed 底部未透明"
-            assert (alpha[150:250, 50:350] == 255).all(), "rectangle-fixed 中心区应不透明"
+        assert result_bgra.shape[:2] == (box_h + ring_pad, 300 + ring_pad), (
+            f"{shape_value} 应交付默认框幅 300x{box_h}+外环 {ring_pad}，实际 {result_bgra.shape[:2]}"
+        )
+        assert (alpha[30:-30, 30:-30] > 200).all(), f"{shape_value} 框内应满幅不透明"
 
 
 def test_crop_shape_unknown_falls_back_to_white_gate(api_client: TestClient):
@@ -425,30 +425,54 @@ def test_batch_outline_width_override(test_settings):
     assert img_bad.shape[0] == 200 + 2 * 18, f"非法值应回退 1.5mm（236），实际 {img_bad.shape[0]}"
 
 
-def test_nobox_shape_pads_square_batch_uniform(test_settings):
-    """第三十五次修订核心回归：无框塑形补方后形状满幅——同批不同宽高比的
-    图，形状大小逐像素一致（旧实现 circle 直径=min 边，形状跟宽高比走）。"""
+def test_nobox_shape_defaults_to_max_centered_box(test_settings):
+    """第三十六次修订核心回归：无框形状=自动默认框（图内居中最大形状包围盒
+    宽高比框）——与带框声明该默认框**逐像素同几何**；宽/长/方图形状区域
+    逐像素一致（批统一）。三十五次补方满幅退役（宽图不再补方 400×400）。"""
     from src.steps.crop import CropStep
 
-    # 两张不同宽高比：宽图 400x200 与长图 200x400
-    wide = np.full((200, 400, 4), (255, 255, 255, 255), np.uint8)
-    tall = np.full((400, 200, 4), (255, 255, 255, 255), np.uint8)
-    r1 = CropStep().run(wide, {"shape": "circle"})
-    r2 = CropStep().run(tall, {"shape": "circle"})
-    assert r1.image_bgr.shape[:2] == (400, 400), f"宽图应补方 400x400，实际 {r1.image_bgr.shape[:2]}"
-    assert r2.image_bgr.shape[:2] == (400, 400), "长图应补方 400x400"
-    # 形状区域（不透明）逐像素一致——批统一铁证
-    a1 = r1.image_bgr[:, :, 3] > 200
-    a2 = r2.image_bgr[:, :, 3] > 200
-    assert np.array_equal(a1, a2), "同批不同宽高比的形状区域应逐像素一致（补方后满幅内接）"
-    # 内容零损失：宽图原内容区（pad 后居中行 100:300）不透明
-    assert (r1.image_bgr[150:250, 0:400, 3] > 200).all(axis=None) or True  # 行在圆内
-    # pad 区在形状外为全透明
-    assert int(r1.image_bgr[0, 0, 3]) == 0, "补方角应透明"
+    # 三张不同宽高比（宽 400x200 / 长 200x400 / 方 200x200），中心放同色标记
+    def make_canvas(height: int, width: int) -> np.ndarray:
+        canvas = np.full((height, width, 4), (255, 255, 255, 255), np.uint8)
+        canvas[height // 2 - 25 : height // 2 + 25, width // 2 - 25 : width // 2 + 25] = (60, 140, 60, 255)
+        return canvas
+
+    r_wide = CropStep().run(make_canvas(200, 400), {"shape": "circle"})
+    r_tall = CropStep().run(make_canvas(400, 200), {"shape": "circle"})
+    r_square = CropStep().run(make_canvas(200, 200), {"shape": "circle"})
+    # 输出幅=默认框幅（min 边正方形），非补方 max 边正方形
+    assert r_wide.image_bgr.shape[:2] == (200, 200), f"宽图默认框应 200x200，实际 {r_wide.image_bgr.shape[:2]}"
+    assert r_tall.image_bgr.shape[:2] == (200, 200), "长图默认框应 200x200"
+    assert r_square.image_bgr.shape[:2] == (200, 200), "方图框=整图 200x200"
+    # 形状区域（不透明）逐像素一致——批统一铁证（circle 默认框=1:1 → 三图同框同圆）
+    a_wide = r_wide.image_bgr[:, :, 3] > 200
+    a_tall = r_tall.image_bgr[:, :, 3] > 200
+    a_square = r_square.image_bgr[:, :, 3] > 200
+    assert np.array_equal(a_wide, a_tall), "宽/长图形状区域应逐像素一致"
+    assert np.array_equal(a_wide, a_square), "宽/方图形状区域应逐像素一致"
+    # 中心标记保留（默认框居中裁，中心内容不丢）
+    assert int(r_wide.image_bgr[100, 100, 0]) == 60, "默认框中心内容丢失"
+
+    # 无框 ≡ 显式声明默认框（同域逐像素一致——统一形状=单独裁剪不动框确认；
+    # 五形状全量：对抗验证变异实验证明 heart/star 此前零锁定，删掩膜调用全库仍绿）
+    from src.steps.outline import default_shape_box
+
+    for shape_value in ("circle", "square", "rectangle-fixed", "heart", "star"):
+        wide = make_canvas(200, 400)
+        left, top, box_w, box_h = default_shape_box(400, 200, shape_value)
+        framed = CropStep().run(wide, {
+            "shape": shape_value,
+            "frame": {"width": 400, "height": 200},
+            "data": {"x": left, "y": top, "width": box_w, "height": box_h},
+        })
+        nobox = CropStep().run(wide, {"shape": shape_value})
+        assert np.array_equal(framed.image_bgr, nobox.image_bgr), (
+            f"{shape_value}: 无框默认框与显式带框声明应同域逐像素一致（统一 ≡ 单独裁剪）"
+        )
 
 
-def test_boxed_shape_not_padded(test_settings):
-    """带框声明不补方（第三十五次修订只改无框路径）：框裁等比映射行为不变。"""
+def test_boxed_shape_crops_to_box(test_settings):
+    """带框声明走框裁（第三十六次修订只改无框路径）：框裁等比映射行为不变。"""
     from src.steps.crop import CropStep
 
     canvas = np.full((200, 400, 4), (255, 255, 255, 255), np.uint8)  # H200×W400（宽图）
@@ -457,3 +481,103 @@ def test_boxed_shape_not_padded(test_settings):
             "data": {"x": 0, "y": 0, "width": 200, "height": 200}}
     result = CropStep().run(canvas, meta)
     assert result.image_bgr.shape[:2] == (200, 200), f"带框应按框裁 200x200，实际 {result.image_bgr.shape[:2]}"
+
+
+def test_default_shape_box_geometry(test_settings):
+    """default_shape_box（第三十六次修订）：图内居中最大形状包围盒宽高比框
+    ——宽高比表与前端 SHAPE_ASPECT_RATIOS 同源（circle/square=1、
+    rectangle-fixed=1.5、heart=32/28.9、star=1.902/1.809），改公式两端同改。"""
+    from src.steps.outline import default_shape_box
+
+    # 宽图 400×200：受高约束 → 框高=200，框宽=round(200×a)
+    assert default_shape_box(400, 200, "circle") == (100, 0, 200, 200)
+    assert default_shape_box(400, 200, "square") == (100, 0, 200, 200)
+    assert default_shape_box(400, 200, "rectangle-fixed") == (50, 0, 300, 200)
+    assert default_shape_box(400, 200, "heart") == (89, 0, 221, 200)      # round(200×32/28.9)=221
+    assert default_shape_box(400, 200, "star") == (95, 0, 210, 200)       # round(200×1.902/1.809)=210
+    # 长图 200×400：受宽约束 → 框宽=200，框高=round(200/a)
+    assert default_shape_box(200, 400, "circle") == (0, 100, 200, 200)
+    assert default_shape_box(200, 400, "rectangle-fixed") == (0, 133, 200, 133)  # round(200/1.5)=133
+    # 方图 300×300：heart 高受约束 → 300×271 居中（非整图）
+    assert default_shape_box(300, 300, "heart") == (0, 14, 300, 271)      # round(300×28.9/32)=271
+    # rectangle/free 无默认框语义：整图
+    assert default_shape_box(400, 200, "rectangle") == (0, 0, 400, 200)
+    assert default_shape_box(400, 200, "free") == (0, 0, 400, 200)
+    # 取整口径锁（第三十六次修订补）：半上取整对齐前端 Math.round——
+    # 1003×1.5=1504.5 精确落点，Python 银行家舍入会给 1504 与 JS 差 1px
+    assert default_shape_box(4000, 1003, "rectangle-fixed") == (1247, 0, 1505, 1003)
+
+
+def test_nobox_heart_star_pixels(test_settings):
+    """无框 heart/star 塑形像素锁（第三十六次修订补——对抗验证变异实验：
+    跳过 heart/star 掩膜调用全库测试仍绿）。锁输出幅=默认框幅 + 不透明区
+    与 crop_shape_region_mask 同形（心形凹口/星形凹角必须透明）。"""
+    from src.steps.crop import CropStep
+    from src.steps.outline import crop_shape_region_mask
+
+    for shape_value, expected_w in (("heart", 221), ("star", 210)):
+        canvas = np.full((200, 400, 4), (255, 255, 255, 255), np.uint8)
+        result = CropStep().run(canvas, {"shape": shape_value})
+        height, width = result.image_bgr.shape[:2]
+        # 默认框幅（200×宽高比：heart 32/28.9→221、star 1.902/1.809→210）
+        assert (height, width) == (200, expected_w), (
+            f"{shape_value} 应交付默认框幅 {expected_w}x200，实际 {width}x{height}"
+        )
+        opaque = result.image_bgr[:, :, 3] > 200
+        ratio = float(opaque.mean())
+        assert 0.3 < ratio < 0.9, f"{shape_value} 不透明占比 {ratio:.3f} 异常（掩膜未生效？）"
+        # 与掩膜同形（羽化 σ0.8 容差 ±2px）：不透明区 ⊆ 掩膜外扩、掩膜内核 ⊆ 不透明区
+        mask = crop_shape_region_mask(shape_value, width, height)
+        grown = cv2.dilate(mask.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        shrunk = cv2.erode(
+            mask.astype(np.uint8), np.ones((5, 5), np.uint8),
+            borderType=cv2.BORDER_CONSTANT, borderValue=0,
+        ) > 0
+        assert not (opaque & ~grown).any(), f"{shape_value} 不透明区越出掩膜（+2px）"
+        assert not (shrunk & ~opaque).any(), f"{shape_value} 掩膜内核（−2px）出现透明洞"
+
+
+def test_shape_mask_fills_default_box(test_settings):
+    """掩膜与宽高比表耦合锁（第三十六次修订补——掩膜几何常量漂移曾零锁定）：
+    在默认框幅画布上各形状掩膜包围盒须撑满画布两向（框比例=形状包围盒比例
+    的兑现——「形状撑满框零空边」）。"""
+    from src.steps.outline import SHAPE_BOX_ASPECT_RATIOS, crop_shape_region_mask, default_shape_box
+
+    for shape_value in SHAPE_BOX_ASPECT_RATIOS:
+        _, _, box_w, box_h = default_shape_box(1000, 700, shape_value)
+        mask = crop_shape_region_mask(shape_value, box_w, box_h)
+        ys, xs = np.where(mask)
+        assert xs.min() <= box_w * 0.01 and (box_w - 1 - xs.max()) <= box_w * 0.01, (
+            f"{shape_value} 掩膜未横向撑满默认框"
+        )
+        assert ys.min() <= box_h * 0.01 and (box_h - 1 - ys.max()) <= box_h * 0.01, (
+            f"{shape_value} 掩膜未纵向撑满默认框"
+        )
+
+
+def test_nobox_vs_framed_after_resize_tolerant(test_settings):
+    """frame≠画布（resize 先行）重映射路径等价锁界（第三十六次修订补——对抗
+    验证发现取整链分叉）：无框（当前幅重算）与弹层默认框（原域框×缩放倍率
+    int() 截断映射，既有代码）交付幅差 ≤1px、不透明区域一致率 ≥99%——
+    「统一≡单独裁剪」在缩放链路的实测界（300DPI 下 1px≈0.08mm 不可见）。"""
+    from src.steps.crop import CropStep
+    from src.steps.outline import default_shape_box
+
+    src_height, src_width = 3000, 1000  # 长图（对抗验证复现例）
+    canvas = np.full((src_height, src_width, 4), (255, 255, 255, 255), np.uint8)
+    # 模拟 5cm 档本地 INTER_AREA 缩放后幅（短边 1000→591）
+    resized = cv2.resize(canvas, (591, 1773), interpolation=cv2.INTER_AREA)
+    nobox = CropStep().run(resized, {"shape": "heart"}).image_bgr
+    left, top, box_w, box_h = default_shape_box(src_width, src_height, "heart")
+    framed = CropStep().run(resized, {
+        "shape": "heart",
+        "frame": {"width": src_width, "height": src_height},
+        "data": {"x": left, "y": top, "width": box_w, "height": box_h},
+    }).image_bgr
+    assert abs(nobox.shape[0] - framed.shape[0]) <= 1 and abs(nobox.shape[1] - framed.shape[1]) <= 1, (
+        f"重映射路径幅差超界：{nobox.shape[:2]} vs {framed.shape[:2]}"
+    )
+    h_min = min(nobox.shape[0], framed.shape[0])
+    w_min = min(nobox.shape[1], framed.shape[1])
+    agreement = float(((nobox[:h_min, :w_min, 3] > 200) == (framed[:h_min, :w_min, 3] > 200)).mean())
+    assert agreement >= 0.99, f"重映射路径不透明区一致率 {agreement:.4f} < 0.99"

@@ -38,7 +38,8 @@ class CropStep:
         crop_meta = {shape, data: {x, y, width, height}, frame}（前端 cropper 框，
         相对原图像素坐标）。**无 data 框但有合法 shape（默认 circle 声明的常态，
         2026-08-26 14:49 翻车修复：旧口径 skipped 致生成图整幅白底交付、形状外
-        不透明）→ 按整图默认框处理（x=0,y=0,w,h=图幅）**——"每图必有形状"
+        不透明）→ 按形状默认框处理（第三十六次修订：图内居中最大形状包围盒
+        宽高比框，与单独裁剪弹层默认框同几何）**——"每图必有形状"
         口径的兑现：非矩形形状一律塑形（形状外 alpha=0，PNG 真 transparent），
         矩形类=全图无操作。完全无 meta / 未知 shape → skipped 原图。
         3 通道输入返回 3 通道（管线口径惯例）。
@@ -58,20 +59,16 @@ class CropStep:
             return CropStepResult(image_ndarray, "skipped")
         image_bgra = ensure_bgra(image_ndarray)
         if not self._box_valid(box):
-            # 无框合法声明（批级统一形状的常态，第二十九次修订）：整图即框
-            # ——直接形状塑形不裁切（无外接框语义），形状外 alpha=0（羽化
-            # 抗锯齿口径）。塑形集合 = 全部非 rectangle 形状（square/
-            # rectangle-fixed 居中内接几何在 crop_shape_region_mask 内，
-            # 2026-08-28 修复"正方形/长方形设置不到图案上"）；rectangle/
-            # free = 整图直通（默认值零行为变化）
+            # 无框合法声明（批级统一形状的常态，第二十九次修订）：形状默认框
+            # （第三十六次修订：图内居中最大形状包围盒宽高比框，与单独裁剪
+            # 弹层默认框同几何——统一形状 ≡ 不动默认框直接确认）——框裁后
+            # 形状满幅塑形，形状外 alpha=0（羽化抗锯齿口径）。塑形集合 =
+            # 全部非 rectangle/free 形状；rectangle/free = 整图直通（默认值
+            # 零行为变化）
             if shape_value != "rectangle" and shape_value != "free":
-                # 居中补方（第三十五次修订）：形状内接跟宽高比走（circle 直径
-                # =min 边）——同批不同宽高比的图形状大小不一（用户截图实锤
-                # "有的顶满有的很小"）。补方到 max 边后满幅内接：形状大小批
-                # 统一；pad 区全透明（内容零损失，不裁只补）
-                image_bgra = self._pad_to_square(image_bgra)
+                image_bgra = self._crop_default_shape_box(image_bgra, shape_value)
                 module_logger.info(
-                    "crop → done: shape=%s 无框补方塑形 %dx%d",
+                    "crop → done: shape=%s 无框默认框塑形 %dx%d",
                     shape_value, image_bgra.shape[1], image_bgra.shape[0],
                 )
                 image_bgra = self._apply_shape_mask(image_bgra, shape_value)
@@ -119,19 +116,20 @@ class CropStep:
         return CropStepResult(result, "done")
 
     @staticmethod
-    def _pad_to_square(image_bgra: np.ndarray) -> np.ndarray:
-        """居中补方（第三十五次修订）：短边方向 pad 全透明到 max(W,H)。
-        内容零损失（不裁只补，原图区像素与 alpha 不动）；已正方形直通。"""
+    def _crop_default_shape_box(image_bgra: np.ndarray, shape_value: str) -> np.ndarray:
+        """无框默认框裁切（第三十六次修订）：default_shape_box 取图内居中
+        最大形状包围盒宽高比框，框裁后形状在框内满幅内接（框比例=形状包围
+        盒比例，形状撑满框零空边）——与带框声明的默认框路径同几何（同域
+        逐像素一致；带框经缩放重映射链有 ≤1px 取整差，技术方案第三十六条⑥
+        记档）。框=整图时直通。三十五次补方满幅退役（形状内接补方正方形
+        必裁非正方形图案的上下角，git 历史可溯）。"""
+        from src.steps.outline import default_shape_box
+
         height, width = image_bgra.shape[:2]
-        side = max(width, height)
-        if width == side and height == side:
+        left, top, box_width, box_height = default_shape_box(width, height, shape_value)
+        if box_width == width and box_height == height:
             return image_bgra
-        pad_x = (side - width) // 2
-        pad_y = (side - height) // 2
-        return cv2.copyMakeBorder(
-            image_bgra, pad_y, side - height - pad_y, pad_x, side - width - pad_x,
-            cv2.BORDER_CONSTANT, value=(0, 0, 0, 0),
-        )
+        return image_bgra[top : top + box_height, left : left + box_width].copy()
 
     @staticmethod
     def _apply_shape_mask(image_bgra: np.ndarray, shape_value: str) -> np.ndarray:

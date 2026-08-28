@@ -496,7 +496,8 @@
 
   // ---- 统一形状批级选择（第二十九次修订；第三十次修订改"后改优先"） ----
   // 未显式裁剪的图提交时以批级形状为默认声明（无框——后端 CropStep 对无框
-  // 形状整图塑形、rectangle 整图直通）。后改优先（第三十次修订）：切换统一
+  // 形状按默认框塑形〔第三十六次修订：与单独裁剪弹层默认框同几何〕、
+  // rectangle 整图直通）。后改优先（第三十次修订）：切换统一
   // 形状 = 全局重声明——逐图已设的形状/裁剪框一并重置跟随统一；之后逐图
   // 再裁剪则自声明优先到下一次统一切换（最后动作优先）。
   // 矩形类批级形状=直通零变化（回显不显标签不画预览，直通不撒谎）。
@@ -565,30 +566,27 @@
     });
   }
 
-  // 未裁剪图的批级形状预览：整图按形状合成——与后端 CropStep 同几何：
-  // 居中补方到正方形（第三十五次修订）再形状满幅 clip，所见即后端塑形结果
+  // 未裁剪图的批级形状预览：与后端 CropStep 同几何——形状默认框（第三十六
+  // 次修订：图内居中最大形状包围盒宽高比框，与单独裁剪弹层默认框一致）框
+  // 裁后形状满幅 clip，所见即后端塑形结果（统一形状 ≡ 单独裁剪不动框确认）
   function attachShapeOnlyPreview(imgElement, item, itemIndex) {
     loadIntoImageElement(item.originalFile).then(function (imageEl) {
       if (pendingImages[itemIndex] !== item) return; // 列表已变（移除/重排）
       var natural = { w: imageEl.naturalWidth, h: imageEl.naturalHeight };
       if (natural.w < 1 || natural.h < 1) return;
       var supersample = 2; // 小缩略图形状边缘抗锯齿（与声明预览同口径）
-      // 补方（第三十五次修订对齐）：画布=max 边正方形，原图居中——形状
-      // 满幅内接（circle 直径=方形边长），不再跟原图宽高比走
-      var side = Math.max(natural.w, natural.h);
-      var canvasSide = side * supersample;
+      // 默认框（第三十六次修订对齐）：画布=框幅（形状包围盒比例），原图按
+      // 框裁居中 draw——形状撑满框，与 attachCroppedPreview 几何一致
+      var box = defaultShapeBox(natural.w, natural.h, batchCropShape);
       var previewCanvas = document.createElement('canvas');
-      previewCanvas.width = canvasSide;
-      previewCanvas.height = canvasSide;
+      previewCanvas.width = box.w * supersample;
+      previewCanvas.height = box.h * supersample;
       var ctx = previewCanvas.getContext('2d');
-      buildShapePath(ctx, batchCropShape, canvasSide, canvasSide);
+      buildShapePath(ctx, batchCropShape, previewCanvas.width, previewCanvas.height);
       ctx.clip();
       ctx.drawImage(
-        imageEl,
-        (canvasSide - natural.w * supersample) / 2,
-        (canvasSide - natural.h * supersample) / 2,
-        natural.w * supersample,
-        natural.h * supersample
+        imageEl, box.x, box.y, box.w, box.h,
+        0, 0, previewCanvas.width, previewCanvas.height
       );
       imgElement.src = previewCanvas.toDataURL('image/png');
     }).catch(function () { /* 预览失败保持原图，不阻塞 */ });
@@ -607,6 +605,27 @@
     'heart': 32 / 28.9,
     'star': 1.902 / 1.809,
   };
+
+  // 形状默认框（第三十六次修订）：图内居中最大形状包围盒宽高比框——与
+  // 后端 outline.default_shape_box 同源同几何（无框统一形状 ≡ 单独裁剪
+  // 弹层 autoCropArea=1 + 宽高比锁定的默认框）；改宽高比表必须两端同改
+  function defaultShapeBox(width, height, shapeValue) {
+    var aspect = SHAPE_ASPECT_RATIOS[shapeValue];
+    if (aspect === undefined || isNaN(aspect) || width < 1 || height < 1) {
+      return { x: 0, y: 0, w: width, h: height }; // rectangle/free：整图即框
+    }
+    var boxW, boxH;
+    if (width / height >= aspect) {
+      boxH = height;
+      boxW = Math.round(height * aspect);
+    } else {
+      boxW = width;
+      boxH = Math.round(width / aspect);
+    }
+    boxW = Math.min(boxW, width);
+    boxH = Math.min(boxH, height);
+    return { x: (width - boxW) / 2, y: (height - boxH) / 2, w: boxW, h: boxH };
+  }
 
   function openCropModal(itemIndex) {
     cropTargetIndex = itemIndex;
@@ -906,7 +925,8 @@
       formData.append('images', item.originalFile, 'image_' + (itemIndex + 1) + '.png');
       // 每图必有形状（2026-08-25 需求；第二十九次修订）：显式裁剪的图用自
       // 声明（shape+框）优先；未显式裁剪的图以批级"统一形状"为默认声明
-      // （无框——后端 CropStep 对 circle/heart/star 整图塑形、矩形类直通；
+      // （无框——后端 CropStep 按形状默认框塑形〔第三十六次修订：与单独
+      // 裁剪不动默认框直接确认同几何〕、rectangle 直通；
       // 默认 rectangle=批级初始值，语义与 2026-08-27 默认值修订一致）
       // 尺寸声明（2026-08-28 第二十八次修订）：批级"统一尺寸"值提交时统一
       // 写入各图 crop_meta.size.cm（逐图尺寸入口已撤）
