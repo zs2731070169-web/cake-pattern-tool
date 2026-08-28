@@ -383,3 +383,42 @@ def test_outer_ring_transparent_beyond_line(test_settings):
     alpha = result.image_bgr[:, :, 3]
     # square 掩膜=全图 → 外环=整圈 pad 带；环带内 alpha=255（线可打印）
     assert (alpha[0:16, 100:300] == 255).all(), "环带应不透明（灰线本体）"
+
+
+def _ring_width_px(bgra: np.ndarray) -> int:
+    """顶环带宽：中线列从画布顶向内数连续灰线像素。"""
+    col = bgra[:, bgra.shape[1] // 2]
+    run = best = 0
+    for y in range(bgra.shape[0]):
+        pixel = col[y]
+        b, g, r = int(pixel[0]), int(pixel[1]), int(pixel[2])
+        a = int(pixel[3]) if pixel.size == 4 else 255
+        ok = abs(b - 190) <= 12 and abs(g - 190) <= 12 and abs(r - 190) <= 12 and a > 200
+        run = run + 1 if ok else (0 if run <= 3 else run)
+        best = max(best, run)
+    return best
+
+
+def test_batch_outline_width_override(test_settings):
+    """批级线宽声明（第三十四次修订）：crop_meta.outline_width_mm 覆盖配置——
+    2.0mm → 24px 线宽、画布外扩 2×24；非法值（5.0 超区间）回退配置 1.5mm。"""
+    from src.jobs.pipeline import RetouchPipeline
+    from src.jobs.store import JobStore
+
+    pipeline = RetouchPipeline(test_settings, JobStore(test_settings))
+    canvas = np.full((200, 200, 3), 255, dtype=np.uint8)
+    cv2.circle(canvas, (100, 100), 60, (60, 140, 60), -1)
+    png = cv2.imencode(".png", canvas)[1].tobytes()
+
+    # 合法覆盖：2.0mm @300DPI = 24px（配置默认 1.5mm=18px，覆盖生效可分辨）
+    meta = json.dumps({"shape": "square", "outline_width_mm": 2.0})
+    result_bytes, _, _ = pipeline._run_steps(png, meta, None)
+    img = cv2.imdecode(np.frombuffer(result_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
+    assert img.shape[0] == 200 + 2 * 24, f"2.0mm 外扩应 248，实际 {img.shape[0]}"
+    assert _ring_width_px(img) >= 22, f"2.0mm 线宽应 ≈24px，实测 {_ring_width_px(img)}"
+
+    # 非法值（5.0 超 1–2 区间）：回退配置 1.5mm → 18px
+    meta_bad = json.dumps({"shape": "square", "outline_width_mm": 5.0})
+    result_bad, _, _ = pipeline._run_steps(png, meta_bad, None)
+    img_bad = cv2.imdecode(np.frombuffer(result_bad, np.uint8), cv2.IMREAD_UNCHANGED)
+    assert img_bad.shape[0] == 200 + 2 * 18, f"非法值应回退 1.5mm（236），实际 {img_bad.shape[0]}"

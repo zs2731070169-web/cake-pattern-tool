@@ -388,9 +388,10 @@
 
   batchTrigger.addEventListener('click', function (event) {
     event.stopPropagation();
-    // 两下拉互斥（第二十九次修订）：开尺寸菜单时收起形状菜单（同排相邻，
-    // 双开错位）
+    // 三下拉互斥（第二十九次修订两下拉口径扩展）：开尺寸菜单时收起形状/
+    // 线宽菜单（同排相邻，双开错位）
     if (shapeDropdown.classList.contains('open')) shapeDropdown.classList.remove('open');
+    if (widthDropdown.classList.contains('open')) widthDropdown.classList.remove('open');
     batchDropdown.classList.toggle('open');
   });
   document.addEventListener('click', function (event) {
@@ -437,6 +438,57 @@
       setBatchTriggerLabel(label);
     }
     renderUploadList();
+  }
+
+  // ---- 统一线宽批级选择（第三十四次修订：1–2mm 步进 0.1，默认跟随配置） ----
+  // 提交时统一写入各图 crop_meta.outline_width_mm；后端合法区间 1.0–2.0，
+  // 缺省（默认档）不写键 → 服务端用 PT_OUTLINE_WIDTH_MM 配置值。
+  var widthDropdown = document.getElementById('batch-width-dropdown');
+  var widthTrigger = document.getElementById('batch-width-trigger');
+  var widthMenu = document.getElementById('batch-width-menu');
+  var batchOutlineWidthMm = null;
+  var WIDTH_OPTIONS = [{ value: '', label: '默认' }];
+  for (var wm = 10; wm <= 20; wm++) {
+    WIDTH_OPTIONS.push({ value: String(wm / 10), label: (wm / 10) + 'mm' });
+  }
+
+  (function initWidthMenu() {
+    WIDTH_OPTIONS.forEach(function (opt) {
+      var optionElement = document.createElement('div');
+      optionElement.className = 'menu-option' + (opt.value === '' ? ' selected' : '');
+      optionElement.textContent = opt.label;
+      optionElement.dataset.value = opt.value;
+      optionElement.addEventListener('click', function () {
+        Array.prototype.forEach.call(widthMenu.children, function (c) { c.classList.remove('selected'); });
+        optionElement.classList.add('selected');
+        widthDropdown.classList.remove('open');
+        batchOutlineWidthMm = opt.value === '' ? null : parseFloat(opt.value);
+        widthTrigger.textContent = opt.label;
+      });
+      widthMenu.appendChild(optionElement);
+    });
+  })();
+
+  widthTrigger.addEventListener('click', function (event) {
+    event.stopPropagation();
+    // 三下拉互斥：开线宽菜单时收起形状/尺寸菜单
+    if (shapeDropdown.classList.contains('open')) shapeDropdown.classList.remove('open');
+    closeBatchDropdown();
+    widthDropdown.classList.toggle('open');
+  });
+  document.addEventListener('click', function (event) {
+    if (widthDropdown.classList.contains('open') && !widthDropdown.contains(event.target)) {
+      widthDropdown.classList.remove('open');
+    }
+  });
+
+  // 提交后复位（与形状/尺寸同规则：批级值只作用于本批）
+  function resetBatchWidthSelection() {
+    batchOutlineWidthMm = null;
+    widthTrigger.textContent = '默认';
+    Array.prototype.forEach.call(widthMenu.children, function (c) {
+      c.classList.toggle('selected', c.dataset.value === '');
+    });
   }
 
   // ---- 统一形状批级选择（第二十九次修订；第三十次修订改"后改优先"） ----
@@ -492,6 +544,7 @@
   shapeTrigger.addEventListener('click', function (event) {
     event.stopPropagation();
     if (batchDropdown.classList.contains('open')) closeBatchDropdown();
+    if (widthDropdown.classList.contains('open')) widthDropdown.classList.remove('open');
     shapeDropdown.classList.toggle('open');
   });
   document.addEventListener('click', function (event) {
@@ -846,6 +899,7 @@
       // 写入各图 crop_meta.size.cm（逐图尺寸入口已撤）
       var seqMeta = item.cropMeta || { shape: batchCropShape, default: true, box: null };
       if (batchSizeCm) seqMeta.size = { cm: batchSizeCm };
+      if (batchOutlineWidthMm) seqMeta.outline_width_mm = batchOutlineWidthMm; // 第三十四次修订
       cropMetaBySeq[String(itemIndex + 1)] = seqMeta;
     });
     formData.append('crop_meta', JSON.stringify(cropMetaBySeq));
@@ -869,6 +923,7 @@
       // 下一批从零开始——trigger 文案与选中态一并复位）
       resetBatchSizeSelection();
       resetBatchShapeSelection();
+      resetBatchWidthSelection();
       // 双栏同屏（2026-08-27 第六次修订）：右栏常驻无需显隐切换与滚动跟随
       resultList.innerHTML = '<div class="status-text processing">处理中，请稍候…</div>';
       serverClockOffsetMs = 0; // 钟差待首轮轮询 server_time 校正

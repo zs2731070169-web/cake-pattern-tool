@@ -322,7 +322,12 @@ class RetouchPipeline:
         # crop 关闭（第二十次修订"不裁框不塑形原图直通"）时描边不施加形状——
         # 外环画法（第三十二次修订）会按形状雕透明，违背直通契约；回退 rectangle
         outline_shape = crop_shape if self._settings.crop_enabled else None
-        outline_result = self._outline_step.run(image_bgr, outline_shape)
+        # 批级"统一线宽"声明（第三十四次修订）：合法区间 1.0–2.0，非法/缺失
+        # 传 None 由 outline_width_pixels 回退配置默认
+        outline_width_mm = None
+        if crop_meta and isinstance(crop_meta.get("outline_width_mm"), (int, float)):
+            outline_width_mm = float(crop_meta["outline_width_mm"])
+        outline_result = self._outline_step.run(image_bgr, outline_shape, outline_width_mm)
         image_bgr = outline_result.image_bgr
         stage_results["outline"] = outline_result.stage_value
 

@@ -46,6 +46,9 @@ OUTLINE_SMOOTH_BLUR_SIGMA = 4.0  # 轮廓平滑：高斯模糊 σ（圆滑像素
 # 硬区——线带最外 1-2px 被羽化吃掉（幅面越大占比越高）。起画内缩线宽
 # +此补偿，厚度按线宽参数画足，物理线宽回到参数值。
 SHAPE_EDGE_FEATHER_COMPENSATION_PX = 2
+# 批级线宽声明合法区间（第三十四次修订，前端下拉 1.0–2.0 同口径）
+OUTLINE_WIDTH_MM_MIN = 1.0
+OUTLINE_WIDTH_MM_MAX = 2.0
 
 
 def edge_band_pixels(image_ndarray: np.ndarray) -> np.ndarray:
@@ -161,13 +164,18 @@ def _threshold_pattern_mask(image_bgra: np.ndarray) -> np.ndarray:
     return pattern.astype(np.uint8) * 255
 
 
-def outline_width_pixels(settings: PatternToolSettings) -> int:
+def outline_width_pixels(settings: PatternToolSettings, width_mm: float | None = None) -> int:
     """描边线宽 mm → px（300DPI 打印基准：px = mm × dpi / 25.4）。
 
     物理毫米语义恒定，与图像尺寸无关：0.5mm ≈ 6px，1.5mm ≈ 18px。
+    width_mm（第三十四次修订）：批级"统一线宽"声明的显式覆盖——合法区间
+    OUTLINE_WIDTH_MM_RANGE 内生效，None/非法回退配置 outline_width_mm。
     """
+    effective_mm = settings.outline_width_mm
+    if width_mm is not None and OUTLINE_WIDTH_MM_MIN <= float(width_mm) <= OUTLINE_WIDTH_MM_MAX:
+        effective_mm = float(width_mm)
     pixels_per_mm = settings.print_dpi / 25.4
-    return max(1, int(round(settings.outline_width_mm * pixels_per_mm)))
+    return max(1, int(round(effective_mm * pixels_per_mm)))
 
 
 def draw_outline(
@@ -318,7 +326,8 @@ def crop_shape_region_mask(shape_value: str, width: int, height: int) -> np.ndar
 # 内容，判定前提不成立。git 历史可溯（v19.6）。
 
 def draw_shape_outline(
-    image_ndarray: np.ndarray, shape_value: str, settings: PatternToolSettings
+    image_ndarray: np.ndarray, shape_value: str, settings: PatternToolSettings,
+    width_mm: float | None = None,
 ) -> np.ndarray:
     """沿形状边界**向外**画灰线（第三十二次修订：外边缘描边）。
 
@@ -334,7 +343,7 @@ def draw_shape_outline(
     image_bgra = ensure_bgra(image_ndarray)
     image_height, image_width = image_bgra.shape[:2]
     shape_mask = crop_shape_region_mask(shape_value, image_width, image_height)
-    thickness = outline_width_pixels(settings)
+    thickness = outline_width_pixels(settings, width_mm)
 
     pad = thickness  # 形状掩膜内接贴画布边，外环需要落位空间
     padded = cv2.copyMakeBorder(
@@ -425,7 +434,10 @@ class OutlineStep:
     def __init__(self, settings: PatternToolSettings) -> None:
         self._settings = settings
 
-    def run(self, image_ndarray: np.ndarray, crop_shape: str | None = None) -> OutlineStepResult:
+    def run(
+        self, image_ndarray: np.ndarray, crop_shape: str | None = None,
+        width_mm: float | None = None,
+    ) -> OutlineStepResult:
         """描边沿形状边界（每图必有形状，2026-08-25 需求）。
 
         crop_shape 为 None / 未知值（防御：api 层已兜底补默认，正常不可达）
@@ -446,9 +458,10 @@ class OutlineStep:
             module_logger.info("outline → skipped (形状边带非白底)")
             return OutlineStepResult(image_ndarray, "skipped")
         # 第三十二次修订：外边缘描边（线环在形状外侧透明区上，永不接触内容）
-        outlined = draw_shape_outline(image_ndarray, shape_value, self._settings)
+        outlined = draw_shape_outline(image_ndarray, shape_value, self._settings, width_mm)
         module_logger.info(
-            "outline → done(外环): 线宽=%dpx 灰度=%d",
-            outline_width_pixels(self._settings), self._settings.outline_gray_level,
+            "outline → done(外环): 线宽=%dpx 灰度=%d%s",
+            outline_width_pixels(self._settings, width_mm), self._settings.outline_gray_level,
+            f"（批级声明 {width_mm}mm）" if width_mm is not None else "",
         )
         return OutlineStepResult(outlined, "done")
