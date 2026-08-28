@@ -64,9 +64,14 @@ class WatermarkStep:
         image_ndarray: np.ndarray,
         original_bgr: np.ndarray | None = None,
         crop_meta_json: str | None = None,
+        precheck_verdict: bool | None = None,
     ) -> WatermarkStepResult:
         """去水印（4.4，2026-08-27 第十次修订）；算法异常由管线捕获转 failed。
 
+        precheck_verdict（2026-08-28 第二十六次修订）：管线入口已并行问过
+        预检时直传结果免二次外呼（仅正常顺序下调用侧传——入口与本步同在
+        原始图白底合成域；fill-first 顺序下本步在换白生成后的图上跑，入口
+        答案不成立，调用侧不传、本步照旧自问）。
         检测：qwen-vl 语义预检（唯一检测器，~¥0.003/次）判有才修。
         修复降级链：缓存（原始域键）→ 石榴智能高级版（唯一供应商，
         异步提交+轮询 ≤60s；佐糖已下线）→ 原图 + heavy-watermark（零误伤）。
@@ -86,8 +91,17 @@ class WatermarkStep:
         module_logger.debug("precheck configured=%s", self._precheck.is_configured())
         if not self._precheck.is_configured():
             return WatermarkStepResult(image_ndarray, "skipped")
-        precheck_verdict = self._precheck.has_watermark(analysis_bgr)
-        module_logger.info("watermark: VL 预检判定=%s", {True: "有水印", False: "无水印", None: "预检失败(按无水印)"}[precheck_verdict])
+        effective_verdict = (
+            precheck_verdict
+            if precheck_verdict is not None
+            else self._precheck.has_watermark(analysis_bgr)
+        )
+        module_logger.info(
+            "watermark: VL 预检判定=%s%s",
+            {True: "有水印", False: "无水印", None: "预检失败(按无水印)"}[effective_verdict],
+            "（入口复用，零外呼）" if precheck_verdict is not None else "",
+        )
+        precheck_verdict = effective_verdict
         is_heavy = False  # heavy 判定依赖 OpenCV mask（已退役），语义档无需此标记
 
         if precheck_verdict is not True:

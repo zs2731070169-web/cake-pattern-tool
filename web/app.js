@@ -1,5 +1,7 @@
-/* pattern-tool 前端逻辑：上传预压 → 可选裁剪 → 提交轮询 → 分端交付。
-   技术方案 7.1：无构建链原生 JS；预压用 canvas；Web Share / ClipboardItem 特性检测降级。 */
+/* pattern-tool 前端逻辑：上传预压 → 批级形状/尺寸设置（+逐图可选裁剪弹层）→ 提交轮询 → 分端交付。
+   技术方案 7.1：无构建链原生 JS；预压用 canvas；Web Share / ClipboardItem 特性检测降级。
+   第二十九次修订：批级"统一形状"自绘下拉（默认自由矩形）——未显式裁剪的图提交时以
+   批级形状为默认声明（无框，后端 CropStep 整图塑形/直通承接）；显式裁剪优先。 */
 (function () {
   'use strict';
 
@@ -26,12 +28,16 @@
     'star': '星形',
   };
 
-  // ---- 处理耗时计时（2026-08-27：卡片任务执行时显示消耗时间）----
-  // 口径：从提交时刻起算的墙钟耗时（含排队——对客户"等多久"最诚实）；
-  // 卡片 DOM 每 10s 轮询重建，计时靠闭包引用的 span 每 500ms 刷新文本，
-  // 轮询到达终态（completed/failed）后定格最后一次数值。
-  var jobSubmittedAtMs = null;
-  var elapsedTimerId = null;
+  // ---- 处理耗时计时（2026-08-28 第二十四次修订重写：仅执行中计时）----
+  // 口径（用户定案，撤销 2026-08-27"墙钟含排队"）：排队中不计时；执行中
+  // 实时走；终态定格服务端真值 finished_at - started_at（不随轮询回涨）。
+  // 架构修复：旧版每卡各建 500ms interval 但共用一个 timerId——每建新卡
+  // 清掉前卡的 interval，批内只有最后渲染那张卡实时走、其余卡冻结在
+  // 10s 轮询值（04.14.43 截图实锤）。新版：单个全局 ticker 遍历刷新全部
+  // 执行中卡的 span（data-start-ms 锚定服务端 started_at + 钟差校正），
+  // 终态卡一次性写入静态文本不参与刷新。
+  var elapsedTickerId = null;
+  var serverClockOffsetMs = 0; // 服务端钟 - 本机钟（每次轮询以 server_time 校正）
 
   function formatElapsed(ms) {
     var totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -42,21 +48,70 @@
       : seconds + '秒';
   }
 
-  function createElapsedTimer() {
+  function parseUtcMs(isoText) {
+    if (!isoText) return null;
+    // 库内格式 "YYYY-MM-DD HH:MM:SS"（空格分隔，UTC naive）→ Date 需 T 分隔
+    var normalized = String(isoText).trim().replace(' ', 'T');
+    var ms = Date.parse(normalized + (normalized.indexOf('Z') < 0 && normalized.slice(-1) !== 'Z' ? 'Z' : ''));
+    return isNaN(ms) ? null : ms;
+  }
+
+  function syncServerClock(serverTimeIso) {
+    var serverMs = parseUtcMs(serverTimeIso);
+    if (serverMs !== null) serverClockOffsetMs = serverMs - Date.now();
+  }
+
+  // 服务端 UTC ISO → 本机钟域的时间戳（叠加钟差：服务端 10:00:00 / 本机
+  // 快 30s → 事件在本机钟域的读数要减去 30s，Date.now() 计时才连续）
+  function serverEventToLocalMs(isoText) {
+    var parsed = parseUtcMs(isoText);
+    return parsed === null ? null : parsed - serverClockOffsetMs;
+  }
+
+  function elapsedTicker() {
+    var spans = resultList.querySelectorAll('.elapsed-timer[data-start-ms]');
+    var nowMs = Date.now();
+    for (var i = 0; i < spans.length; i++) {
+      var startMs = Number(spans[i].getAttribute('data-start-ms'));
+      if (!isNaN(startMs)) {
+        spans[i].textContent = formatElapsed(nowMs - startMs);
+      }
+    }
+  }
+
+  function ensureElapsedTicker() {
+    if (elapsedTickerId) return;
+    elapsedTickerId = setInterval(elapsedTicker, 500);
+  }
+
+  function stopElapsedTicker() {
+    if (elapsedTickerId) { clearInterval(elapsedTickerId); elapsedTickerId = null; }
+  }
+
+  // 执行中卡：挂动态计时 span（锚=服务端 started_at 校正到本机钟域）
+  function createProcessingTimer(startedAtIso) {
     var span = document.createElement('span');
     span.className = 'elapsed-timer';
-    var refresh = function () {
-      if (jobSubmittedAtMs === null) return;
-      span.textContent = formatElapsed(Date.now() - jobSubmittedAtMs);
-    };
-    refresh();
-    if (elapsedTimerId) clearInterval(elapsedTimerId);
-    elapsedTimerId = setInterval(refresh, 500);
+    var startMs = serverEventToLocalMs(startedAtIso);
+    if (startMs !== null) {
+      span.setAttribute('data-start-ms', String(startMs));
+      span.textContent = formatElapsed(Date.now() - startMs);
+    } else {
+      span.textContent = ''; // 防御：无 started_at（旧批/异常）不显示计时
+    }
     return span;
   }
 
-  function stopElapsedTimer() {
-    if (elapsedTimerId) { clearInterval(elapsedTimerId); elapsedTimerId = null; }
+  // 终态卡：定格真值 finished_at - started_at（服务端两时之差，与钟差无关）
+  function createFinalElapsed(startedAtIso, finishedAtIso) {
+    var span = document.createElement('span');
+    span.className = 'elapsed-timer';
+    var startMs = parseUtcMs(startedAtIso);
+    var endMs = parseUtcMs(finishedAtIso);
+    span.textContent = (startMs !== null && endMs !== null)
+      ? formatElapsed(endMs - startMs)
+      : '';
+    return span;
   }
 
   // ---- 状态 ----
@@ -164,10 +219,15 @@
       var thumb = document.createElement('img');
       thumb.className = 'thumb';
       thumb.src = item.previewUrl;
+      // 回显形状来源（第二十九次修订）：显式裁剪的图按自声明框现画预览；
+      // 未裁剪的图按批级形状画整图预览（rectangle 直通无几何差异不画预览，
+      // 其余形状画形状预览——所见即后端 CropStep 整图塑形结果）
       if (item.cropMeta && item.cropMeta.data && item.cropMeta.data.width > 0) {
         // 声明式裁剪回显（2026-08-26）：缩略图按声明现画形状预览（框裁+形状遮罩，
         // 形状外透明→thumb-wrap 棋盘格底）——仅展示层，提交仍是原图+声明
         attachCroppedPreview(thumb, item, itemIndex);
+      } else if (isShapedBatchDefault()) {
+        attachShapeOnlyPreview(thumb, item, itemIndex);
       }
       thumbWrap.appendChild(seqBadge);
       thumbWrap.appendChild(thumb);
@@ -177,57 +237,18 @@
       var infoLine = document.createElement('div');
       infoLine.textContent = formatBytes(item.file.size) + (item.cropMeta ? ' · 已裁剪' : '');
       info.appendChild(infoLine);
-      if (item.cropMeta && item.cropMeta.shape) {
-        var shapeTag = document.createElement('div');
-        shapeTag.className = 'tag done';
-        shapeTag.textContent = '形状: ' + (SHAPE_LABELS[item.cropMeta.shape] || item.cropMeta.shape);
-        info.appendChild(shapeTag);
-      }
-      // 尺寸选择（2026-08-26 新增，逐图独立；默认不选=原幅交付）
-      var sizeRow = document.createElement('div');
-      sizeRow.className = 'size-row';
-      var sizeSelect = document.createElement('select');
-      sizeSelect.className = 'size-select';
-      var defaultOption = document.createElement('option');
-      defaultOption.value = '';
-      defaultOption.textContent = '不设置（原图大小）';
-      sizeSelect.appendChild(defaultOption);
-      SIZE_OPTIONS.forEach(function (opt) {
-        var option = document.createElement('option');
-        option.value = String(opt.cm);
-        option.textContent = opt.label;
-        sizeSelect.appendChild(option);
-      });
-      var customOption = document.createElement('option');
-      customOption.value = 'custom';
-      // 有自定义值时选项文字带上数值（2026-08-27 空白 bug 修复配套：
-      // 非档位值选中 custom 项，文字显示实际尺寸）
-      var isCustomValue = item.sizeCm && !SIZE_OPTIONS.some(function (opt) { return String(opt.cm) === String(item.sizeCm); });
-      customOption.textContent = isCustomValue ? '自定义：' + item.sizeCm + 'cm' : '自定义 (cm)';
-      sizeSelect.appendChild(customOption);
-      // 选中值（2026-08-27 修复）：非档位值赋 String(sizeCm) 时 select 找不到
-      // 对应 option → value 归空、显示空白（统一尺寸设 32 后逐图全白的根因）
-      // ——档位值选档位项，非档位值（含自定义）一律落 custom 项
-      sizeSelect.value = isCustomValue ? 'custom' : (item.sizeCm ? String(item.sizeCm) : '');
-      sizeSelect.addEventListener('change', function () {
-        if (sizeSelect.value === 'custom') {
-          var input = window.prompt('输入打印尺寸（厘米，5-33，上限=打印机最大幅面）', item.sizeCm || '15');
-          var parsed = parseFloat(input);
-          if (input != null && !isNaN(parsed) && parsed >= 5 && parsed <= 33) {
-            item.sizeCm = parsed;
-            sizeSelect.value = 'custom';
-          } else {
-            sizeSelect.value = item.sizeCm ? 'custom' : '';
-            if (input != null) window.alert('请输入 5-33 之间的数字（33cm 为打印机最大幅面）');
-          }
-        } else if (sizeSelect.value === '') {
-          item.sizeCm = null;
-        } else {
-          item.sizeCm = parseFloat(sizeSelect.value);
-        }
-      });
-      sizeRow.appendChild(sizeSelect);
-      info.appendChild(sizeRow);
+      // 形状标签恒显示（第二十九次修订同日修复"自由矩形设置不上去"——rectangle
+      // 后端真实生效（直通+边框描边）但旧前端不显标签，用户无从确认；批级形状
+      // 对未裁剪图总是生效，标签与 trigger 选中态一致给出可见确认）
+      var effectiveShape = item.cropMeta ? item.cropMeta.shape : batchCropShape;
+      var shapeTag = document.createElement('div');
+      shapeTag.className = 'tag done';
+      shapeTag.textContent = (item.cropMeta ? '形状: ' : '形状(统一): ')
+        + (SHAPE_LABELS[effectiveShape] || effectiveShape);
+      info.appendChild(shapeTag);
+      // 逐图尺寸下拉已撤（2026-08-28 第二十八次修订：尺寸仅批级"统一尺寸"
+      // 一个入口，提交时统一写入各图 size 声明——用户定案"不需要给每个图
+      // 设置尺寸"）
 
       var actions = document.createElement('div');
       actions.className = 'card-actions';
@@ -257,6 +278,8 @@
     submitButton.textContent = pendingImages.length === 0
       ? '开始处理'
       : '开始处理（' + pendingImages.length + ' 张）';
+    // 批级设置行恒显示（第二十九次修订同日定案撤销"先上传再设置"隐藏闸——
+    // 批级值先选好再上传同样成立，不做显隐切换）
   }
 
   // ---- 文件接入 ----
@@ -289,7 +312,6 @@
         file: processedBlob,
         previewUrl: URL.createObjectURL(processedBlob),
         cropMeta: null,
-        sizeCm: null,
         // 原图独立留存：裁剪只改 file/previewUrl，重新裁剪始终从原图出发（不叠加裁剪）
         originalFile: processedBlob,
         originalPreviewUrl: URL.createObjectURL(processedBlob),
@@ -322,14 +344,18 @@
     acceptFiles(event.dataTransfer.files);
   });
 
-  // ---- 统一尺寸批量设置（2026-08-27 第七次修订；同日改自绘下拉）----
-  // 同批多图打印尺寸相同时一键写入 item.sizeCm，免逐张下拉；选"清除"恢复
-  // 各图独立（null）。逐图下拉仍可后续单独覆盖——批量只写值不锁编辑。
+  // ---- 统一尺寸批级设置（2026-08-28 第二十八次修订重写：尺寸唯一入口）----
+  // 逐图尺寸下拉已撤——打印尺寸整批一个值（batchSizeCm），提交时统一写入
+  // 全部图的 crop_meta.size.cm。旧实现"选中即逐图写值"，选完再补传的图静默
+  // 无尺寸（"全部: xx"文案与事实不符）；批级变量下补传图自动同批生效，
+  // trigger 文案即单一事实源。取消自定义输入时同步清空批级值（旧实现 UI
+  // 回退但各图隐藏值残留，显示撒谎）。
   // 自绘原因：原生 select 选项永远浮层遮挡内容（浏览器行为不可改），用户
   // 要求选项从选择器下方滑出并推开内容——文档流展开 + max-height 过渡实现。
   var batchDropdown = document.getElementById('batch-size-dropdown');
   var batchTrigger = document.getElementById('batch-size-trigger');
   var batchMenu = document.getElementById('batch-size-menu');
+  var batchSizeCm = null; // 批级打印尺寸（cm；null=不设置原幅交付）
   var BATCH_OPTIONS = [{ value: '', label: '不设置（原图大小）' }]
     .concat(SIZE_OPTIONS.map(function (opt) { return { value: String(opt.cm), label: '全部: ' + opt.label }; }))
     .concat([{ value: 'custom', label: '全部: 自定义 (cm)' }]);
@@ -362,11 +388,9 @@
 
   batchTrigger.addEventListener('click', function (event) {
     event.stopPropagation();
-    // 先上传再设置（2026-08-28）：无图时"统一尺寸"无作用对象，提示而非开菜单
-    if (pendingImages.length === 0) {
-      window.alert('请先上传图片，再设置统一尺寸');
-      return;
-    }
+    // 两下拉互斥（第二十九次修订）：开尺寸菜单时收起形状菜单（同排相邻，
+    // 双开错位）
+    if (shapeDropdown.classList.contains('open')) shapeDropdown.classList.remove('open');
     batchDropdown.classList.toggle('open');
   });
   document.addEventListener('click', function (event) {
@@ -375,8 +399,10 @@
     }
   });
 
-  // 提交后复位（trigger 文案 + 选中态回"不设置"；图片列表已清无需重渲）
+  // 提交后复位（批级值 + trigger 文案 + 选中态回"不设置"——下一批从零开始，
+  // 2026-08-27 用户定案"批量值只作用于本批"）
   function resetBatchSizeSelection() {
+    batchSizeCm = null;
     setBatchTriggerLabel('不设置（原图大小）');
     Array.prototype.forEach.call(batchMenu.children, function (c) {
       c.classList.toggle('selected', c.dataset.value === '');
@@ -384,24 +410,22 @@
   }
 
   function applyBatchSize(value, label) {
-    // ''（不设置）：全部恢复各图独立（2026-08-27 修复——旧代码对 '' 直接
-    // return，选回"不设置"后每张图仍停留原尺寸）
     if (value === '') {
-      pendingImages.forEach(function (item) { item.sizeCm = null; });
+      batchSizeCm = null;
       setBatchTriggerLabel('不设置（原图大小）');
       renderUploadList();
       return;
     }
-    var sizeCm;
     if (value === 'custom') {
       var input = window.prompt('输入统一打印尺寸（厘米，5-33，上限=打印机最大幅面）', '15');
       var parsed = parseFloat(input);
       if (input != null && !isNaN(parsed) && parsed >= 5 && parsed <= 33) {
-        sizeCm = parsed;
+        batchSizeCm = parsed;
         setBatchTriggerLabel('全部: ' + parsed + 'cm');
       } else {
         if (input != null) window.alert('请输入 5-33 之间的数字（33cm 为打印机最大幅面）');
-        // 取消输入：回退选中态到"不设置"
+        // 取消输入：批级值与选中态一并回"不设置"（不留隐藏残留值）
+        batchSizeCm = null;
         Array.prototype.forEach.call(batchMenu.children, function (c) {
           c.classList.toggle('selected', c.dataset.value === '');
         });
@@ -409,11 +433,90 @@
         return;
       }
     } else {
-      sizeCm = parseFloat(value);
+      batchSizeCm = parseFloat(value);
       setBatchTriggerLabel(label);
     }
-    pendingImages.forEach(function (item) { item.sizeCm = sizeCm; });
-    renderUploadList(); // 逐图下拉同步显示新值
+    renderUploadList();
+  }
+
+  // ---- 统一形状批级选择（2026-08-28 第二十九次修订；与统一尺寸同款自绘下拉） ----
+  // 未显式裁剪的图提交时以批级形状为默认声明（无框——后端 CropStep 对无框
+  // circle/heart/star 整图塑形、矩形类整图直通）；显式裁剪的图用自声明优先。
+  // 矩形类批级形状=直通零变化（回显不显标签不画预览，直通不撒谎）。
+  var shapeDropdown = document.getElementById('batch-shape-dropdown');
+  var shapeTrigger = document.getElementById('batch-shape-trigger');
+  var shapeMenu = document.getElementById('batch-shape-menu');
+  var batchCropShape = 'rectangle'; // 批级默认形状（rectangle=整图直通）
+  var SHAPE_DROPDOWN_OPTIONS = [
+    { value: 'rectangle', label: '自由矩形（默认）' },
+    { value: 'circle', label: '圆形' },
+    { value: 'square', label: '正方形' },
+    { value: 'rectangle-fixed', label: '长方形' },
+    { value: 'heart', label: '爱心' },
+    { value: 'star', label: '星形' },
+  ];
+
+  // 批级形状预览是否画形状合成（rectangle 全图直通画了也无视觉差异，不画；
+  // 其余形状有居中内接几何差异，画预览所见即后端塑形结果——第二十九次修订）
+  function isShapedBatchDefault() {
+    return batchCropShape !== 'rectangle';
+  }
+
+  (function initShapeMenu() {
+    SHAPE_DROPDOWN_OPTIONS.forEach(function (opt) {
+      var optionElement = document.createElement('div');
+      optionElement.className = 'menu-option' + (opt.value === 'rectangle' ? ' selected' : '');
+      optionElement.textContent = opt.label;
+      optionElement.dataset.value = opt.value;
+      optionElement.addEventListener('click', function () {
+        Array.prototype.forEach.call(shapeMenu.children, function (c) { c.classList.remove('selected'); });
+        optionElement.classList.add('selected');
+        shapeDropdown.classList.remove('open');
+        batchCropShape = opt.value;
+        shapeTrigger.textContent = opt.label;
+        renderUploadList(); // 未裁剪图的形状标签/预览即时刷新
+      });
+      shapeMenu.appendChild(optionElement);
+    });
+  })();
+
+  shapeTrigger.addEventListener('click', function (event) {
+    event.stopPropagation();
+    if (batchDropdown.classList.contains('open')) closeBatchDropdown();
+    shapeDropdown.classList.toggle('open');
+  });
+  document.addEventListener('click', function (event) {
+    if (shapeDropdown.classList.contains('open') && !shapeDropdown.contains(event.target)) {
+      shapeDropdown.classList.remove('open');
+    }
+  });
+
+  // 提交后复位（批级形状与尺寸同规则：只作用于本批，下一批回默认）
+  function resetBatchShapeSelection() {
+    batchCropShape = 'rectangle';
+    shapeTrigger.textContent = '自由矩形（默认）';
+    Array.prototype.forEach.call(shapeMenu.children, function (c) {
+      c.classList.toggle('selected', c.dataset.value === 'rectangle');
+    });
+  }
+
+  // 未裁剪图的批级形状预览：整图按形状合成（复用 attachCroppedPreview 的
+  // 声明合成管线——整图框 + 形状 clip），所见即后端整图塑形结果
+  function attachShapeOnlyPreview(imgElement, item, itemIndex) {
+    loadIntoImageElement(item.originalFile).then(function (imageEl) {
+      if (pendingImages[itemIndex] !== item) return; // 列表已变（移除/重排）
+      var natural = { w: imageEl.naturalWidth, h: imageEl.naturalHeight };
+      if (natural.w < 1 || natural.h < 1) return;
+      var supersample = 2; // 小缩略图形状边缘抗锯齿（与声明预览同口径）
+      var previewCanvas = document.createElement('canvas');
+      previewCanvas.width = natural.w * supersample;
+      previewCanvas.height = natural.h * supersample;
+      var ctx = previewCanvas.getContext('2d');
+      buildShapePath(ctx, batchCropShape, previewCanvas.width, previewCanvas.height);
+      ctx.clip();
+      ctx.drawImage(imageEl, 0, 0, previewCanvas.width, previewCanvas.height);
+      imgElement.src = previewCanvas.toDataURL('image/png');
+    }).catch(function () { /* 预览失败保持原图，不阻塞 */ });
   }
 
   // ---- 裁剪交互（cropperjs 1.x API；形状=宽高比约束 + crop 后遮罩塑形） ----
@@ -621,8 +724,10 @@
       previewCanvas.width = cropRect.w * supersample;
       previewCanvas.height = cropRect.h * supersample;
       var ctx = previewCanvas.getContext('2d');
-      if (meta.shape !== 'rectangle' && meta.shape !== 'rectangle-fixed' && meta.shape !== 'square') {
-        // 形状遮罩：clip 后画图，形状外保持透明（棋盘格底透出形状观感）
+      if (meta.shape !== 'rectangle') {
+        // 形状遮罩：clip 后画图，形状外保持透明（棋盘格底透出形状观感）。
+        // square/rectangle-fixed 也走 clip（第二十九次修订：居中内接几何，
+        // buildShapePath 同源；带框裁剪预览下框幅即画布，正方形/3:2 内接可视）
         buildShapePath(ctx, meta.shape, previewCanvas.width, previewCanvas.height);
         ctx.clip();
       }
@@ -636,6 +741,30 @@
 
   function buildShapePath(context, shapeValue, width, height) {
     var centerX = width / 2, centerY = height / 2, radius = Math.min(width, height) / 2;
+    if (shapeValue === 'square') {
+      // 居中正方形（第二十九次修订：与后端 crop_shape_region_mask 同源——
+      // square/rectangle-fixed 不再全图直通，选了形状就要看得见形状）
+      var side = Math.min(width, height);
+      context.beginPath();
+      context.rect((width - side) / 2, (height - side) / 2, side, side);
+      context.closePath();
+      return;
+    }
+    if (shapeValue === 'rectangle-fixed') {
+      // 居中 3:2 长方形（宽高比与弹层 SHAPE_ASPECT_RATIOS 同源）
+      var rectW, rectH;
+      if (Math.round(height * 1.5) <= width) {
+        rectH = height;
+        rectW = Math.round(height * 1.5);
+      } else {
+        rectW = width;
+        rectH = Math.round(width / 1.5);
+      }
+      context.beginPath();
+      context.rect((width - rectW) / 2, (height - rectH) / 2, rectW, rectH);
+      context.closePath();
+      return;
+    }
     if (shapeValue === 'circle') {
       context.beginPath();
       context.arc(centerX, centerY, radius, 0, Math.PI * 2);
@@ -697,12 +826,14 @@
       // 声明形状+框；后端管线在原始域处理 + CropStep 运行时裁剪——
       // 同图不同形状共享全部服务端缓存，模型零重复外呼
       formData.append('images', item.originalFile, 'image_' + (itemIndex + 1) + '.png');
-      // 每图必有形状（2026-08-25 需求；2026-08-27 默认值修订）：未显式裁剪
-      // 的图默认=矩形整图（不裁切不透明化，描边沿整图边框）——原默认圆形
-      // 撤销（用户实测"没选形状被裁成圆"非预期）
-      // 尺寸声明（2026-08-26）：选了打印尺寸时随 crop_meta 附 size.cm
-      var seqMeta = item.cropMeta || { shape: 'rectangle', default: true, box: null };
-      if (item.sizeCm) seqMeta.size = { cm: item.sizeCm };
+      // 每图必有形状（2026-08-25 需求；第二十九次修订）：显式裁剪的图用自
+      // 声明（shape+框）优先；未显式裁剪的图以批级"统一形状"为默认声明
+      // （无框——后端 CropStep 对 circle/heart/star 整图塑形、矩形类直通；
+      // 默认 rectangle=批级初始值，语义与 2026-08-27 默认值修订一致）
+      // 尺寸声明（2026-08-28 第二十八次修订）：批级"统一尺寸"值提交时统一
+      // 写入各图 crop_meta.size.cm（逐图尺寸入口已撤）
+      var seqMeta = item.cropMeta || { shape: batchCropShape, default: true, box: null };
+      if (batchSizeCm) seqMeta.size = { cm: batchSizeCm };
       cropMetaBySeq[String(itemIndex + 1)] = seqMeta;
     });
     formData.append('crop_meta', JSON.stringify(cropMetaBySeq));
@@ -722,12 +853,13 @@
       });
       pendingImages = [];
       renderUploadList();
-      // 提交后统一尺寸回"不设置"（2026-08-27 用户定案：批量值只作用于本批，
+      // 提交后统一尺寸/形状回默认（2026-08-27 用户定案：批量值只作用于本批，
       // 下一批从零开始——trigger 文案与选中态一并复位）
       resetBatchSizeSelection();
+      resetBatchShapeSelection();
       // 双栏同屏（2026-08-27 第六次修订）：右栏常驻无需显隐切换与滚动跟随
       resultList.innerHTML = '<div class="status-text processing">处理中，请稍候…</div>';
-      jobSubmittedAtMs = Date.now(); // 耗时计时起点（2026-08-27）
+      serverClockOffsetMs = 0; // 钟差待首轮轮询 server_time 校正
       startPolling();
     } catch (submitError) {
       alert(submitError.message || '提交失败，请重试');
@@ -752,16 +884,18 @@
       var response = await fetch('/api/jobs/' + submittingJobId);
       if (response.status === 404) {
         stopPolling();
-        stopElapsedTimer(); // 计时随批次终止（2026-08-27）
+        stopElapsedTicker(); // 计时随批次终止（2026-08-28）
         resultList.innerHTML = '<div class="status-text failed">批次已过期，请重新上传</div>';
         return;
       }
       if (!response.ok) return; // 瞬时错误：下轮重试
       var jobStatus = await response.json();
+      syncServerClock(jobStatus.server_time); // 钟差校正先于渲染（计时锚点用）
       renderResults(jobStatus);
       if (jobStatus.status === 'completed') {
         stopPolling();
-        stopElapsedTimer(); // 全部终态：计时定格在最后一次刷新值
+        // 全部终态：终态卡是静态文本无需 ticker；有动态 span 残留（防御）再停
+        if (!resultList.querySelector('.elapsed-timer[data-start-ms]')) stopElapsedTicker();
       }
     } catch (networkError) { /* 网络抖动下轮重试 */ }
   }
@@ -784,9 +918,9 @@
   // ---- 结果渲染与分端交付 ----
 
   // 全部执行步骤展示（2026-08-26 补裁剪/缩放）；crop 记档是声明 JSON 特判
-  // 执行顺序（垂直排列）：去水印→填充→裁剪→描边→分辨率（2026-08-26 21:54
+  // 管线执行顺序（第二十七次修订）：去水印→填充→缩放→裁剪→描边（2026-08-26 21:54
   // 补 resize 格；值=实际分辨率，异步从结果图回填，回填前显示状态词）
-  var STAGE_LABELS = {watermark: '去水印', fill: '填充', crop: '裁剪', outline: '描边', resize: '分辨率'};
+  var STAGE_LABELS = {watermark: '去水印', fill: '填充', resize: '分辨率', crop: '裁剪', outline: '描边'};
   var STAGE_VALUE_LABELS = { 'done': '已处理', 'skipped': '跳过', 'fallback': '保留原样', 'done(api)': 'AI处理', 'done(degraded)': 'AI降级', '白色背景': '白底替换', 'done(upscaled)': '已自动提升' };
   var SHAPE_CN = { circle: '圆形', square: '正方形', rectangle: '自由矩形', 'rectangle-fixed': '长方形', heart: '爱心', star: '星形', free: '自由矩形' };
   // quality_hint 提示已全线撤销（2026-08-27 用户定案：heavy-watermark 提示
@@ -916,16 +1050,16 @@
       completed: '完成',
       failed: '失败',
     }[imageStatus.status] || imageStatus.status;
-    // 消耗计时（2026-08-27）：未终态挂实时计时（含排队口径）；终态定格
-    // 显示总耗时——客户对"这张图花了多久"一目了然
-    if (imageStatus.status === 'queued' || imageStatus.status === 'processing') {
-      statusLine.appendChild(createElapsedTimer());
-    } else if (jobSubmittedAtMs !== null) {
-      var finalTimer = document.createElement('span');
-      finalTimer.className = 'elapsed-timer';
-      finalTimer.textContent = formatElapsed(Date.now() - jobSubmittedAtMs);
-      statusLine.appendChild(finalTimer);
+    // 消耗计时（2026-08-28 第二十四次修订）：排队中**不计时**（用户定案
+    // "只有执行中的图才计时"）；执行中挂动态 span（全局 ticker 500ms 刷新）；
+    // 终态定格服务端真值 finished_at - started_at（不再随轮询回涨）
+    if (imageStatus.status === 'processing') {
+      statusLine.appendChild(createProcessingTimer(imageStatus.started_at));
+      ensureElapsedTicker();
+    } else if (imageStatus.status === 'completed' || imageStatus.status === 'failed') {
+      statusLine.appendChild(createFinalElapsed(imageStatus.started_at, imageStatus.finished_at));
     }
+    // queued：无计时 span——排队不计入执行耗时
     info.appendChild(statusLine);
 
     if (imageStatus.status === 'failed' && imageStatus.error_msg) {
@@ -1057,8 +1191,7 @@
 
   restartButton.addEventListener('click', function () {
     stopPolling();
-    stopElapsedTimer(); // 计时随会话重置（2026-08-27）
-    jobSubmittedAtMs = null;
+    stopElapsedTicker(); // 计时随会话重置（2026-08-28）
     submittingJobId = null;
     showResultPlaceholder(); // 双栏常驻：回引导态而非隐藏
     hideResultZoom();

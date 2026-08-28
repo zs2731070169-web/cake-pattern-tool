@@ -4,6 +4,12 @@
 应用工厂 include——本模块不再创建 FastAPI 实例、不挂中间件、不挂静态目录，
 只声明接口与校验逻辑。
 
+2026-08-28 第二十三次修订：四接口均为**同步 def**——接口体内的 SQLite 读写、
+文件落盘、图像解码/PNG 编码由 FastAPI 自动 run_in_threadpool 丢入 Starlette
+anyio 线程池执行，uvicorn 事件循环只留请求解析与响应编排（async def 形态下
+建批 9 张 3600×3600 图的秒级解码编码会连续卡住全站轮询）。同步体内不能
+await：UploadFile 读取用 upload_file.file.read()（底层同一 SpooledTemporaryFile）。
+
 技术方案 4.1 接口清单与错误码：
 - POST /api/jobs（multipart 1-9 图）→ JobCreateResponse；
 - GET /api/jobs/{job_id} → JobStatusResponse（轮询 2-3s，批粒度）；
@@ -24,7 +30,7 @@ from pydantic import BaseModel, Field
 from src.app.deps import get_job_store, get_pipeline, get_settings
 from src.core.config import PatternToolSettings
 from src.jobs.pipeline import RetouchPipeline
-from src.jobs.store import JobStore
+from src.jobs.store import JobStore, _format_utc, utc_now
 from src.steps.imaging import ImageDecodeError, probe_image_size
 
 module_logger = logging.getLogger("pattern_tool.api")
@@ -67,6 +73,14 @@ class ImageStatusDTO(BaseModel):
     quality_hint: str = Field(description="none / heavy-watermark（low-res 已撤 2026-08-27）")
     result_url: str | None = Field(default=None, description="completed 时有值（相对路径）")
     error_msg: str | None = Field(default=None, description="failed 时有值（脱敏话术）")
+    started_at: str | None = Field(
+        default=None,
+        description="开始处理时间（UTC ISO；置 processing 时写。2026-08-28 第二十四次修订：前端仅执行中计时的锚点）",
+    )
+    finished_at: str | None = Field(
+        default=None,
+        description="完成/失败时间（UTC ISO）——与 started_at 之差即单图真实执行耗时",
+    )
 
 
 class JobStatusResponse(BaseModel):
@@ -75,6 +89,9 @@ class JobStatusResponse(BaseModel):
     job_id: str = Field(description="批次 ID")
     status: str = Field(description="processing / completed")
     images: list[ImageStatusDTO] = Field(description="逐图状态，顺序=上传顺序")
+    server_time: str = Field(
+        description="响应生成时刻（UTC ISO）——前端钟差校正：本机钟与服务端钟有偏差时按此校准计时起点",
+    )
 
 
 class MetaResponse(BaseModel):
@@ -120,7 +137,7 @@ def ensure_job_exists(job_id: str, store: JobStore):
 
 
 @router.post("/jobs", response_model=JobCreateResponse)
-async def create_job(
+def create_job(
     request: Request,
     images: list[UploadFile] = File(description="1-9 张图片（PNG/JPG/WebP）"),
     crop_meta: str | None = File(default=None, description="逐图裁剪声明 JSON（仅记档）"),
@@ -155,7 +172,7 @@ async def create_job(
                 raise validation_error(
                     f"第 {upload_index} 张图片格式不支持（仅 PNG/JPG/WebP）"
                 )
-            image_bytes = await upload_file.read()
+            image_bytes = upload_file.file.read()
             uploaded_image_chunks.append(image_bytes)
             # 字节上限（15MB 硬上限）
             if len(image_bytes) > effective_settings.max_image_bytes:
@@ -215,7 +232,7 @@ async def create_job(
         # 前端裁剪过的图带上原图 → 去水印在原始域执行，同图不同裁剪共享缓存免重复计费。
         if originals:
             for seq, original_file in enumerate(originals[:len(images)], start=1):
-                original_bytes = await original_file.read()
+                original_bytes = original_file.file.read()
                 if not original_bytes:
                     continue
                 try:
@@ -275,7 +292,7 @@ async def create_job(
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)
-async def get_job_status(
+def get_job_status(
     job_id: str,
     store: JobStore = Depends(get_job_store),
 ) -> JobStatusResponse:
@@ -303,16 +320,23 @@ async def get_job_status(
                     else None
                 ),
                 error_msg=image_record.error_msg,
+                started_at=_format_utc(image_record.started_at) if image_record.started_at else None,
+                finished_at=_format_utc(image_record.finished_at) if image_record.finished_at else None,
             )
         )
-    return JobStatusResponse(job_id=job_record.job_id, status=job_record.status, images=image_dtos)
+    return JobStatusResponse(
+        job_id=job_record.job_id,
+        status=job_record.status,
+        images=image_dtos,
+        server_time=_format_utc(utc_now()),
+    )
 
 
 # ---- 接口 3：结果下载 ----
 
 
 @router.get("/jobs/{job_id}/images/{image_id}/result")
-async def download_result(
+def download_result(
     job_id: str,
     image_id: str,
     store: JobStore = Depends(get_job_store),
@@ -337,7 +361,7 @@ async def download_result(
 
 
 @router.get("/meta", response_model=MetaResponse)
-async def get_meta(
+def get_meta(
     effective_settings: PatternToolSettings = Depends(get_settings),
 ) -> MetaResponse:
     return MetaResponse(

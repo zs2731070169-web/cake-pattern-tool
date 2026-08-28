@@ -63,6 +63,7 @@ class JobImageRecord:
     stage_results: dict[str, str] = field(default_factory=dict)  # 各步结果（watermark/fill/outline → done/skipped/fallback）
     quality_hint: str = "none"  # 质量提示：none / heavy-watermark（low-res 已撤 2026-08-27）
     error_msg: str | None = None  # 失败原因（仅 failed 时有值，出接口前脱敏）
+    started_at: datetime | None = None  # 开始处理时间（置 processing 时写；2026-08-28 第二十四次修订）
     finished_at: datetime | None = None  # 处理完成或失败时间
 
 
@@ -95,6 +96,14 @@ class JobStore:
         schema_path = PROJECT_ROOT_DIR / "db" / "schema.sql"
         connection = self._get_connection()
         connection.executescript(schema_path.read_text(encoding="utf-8"))
+        # 旧库补列（2026-08-28 第二十四次修订）：生产部署不清 data/，已存在的
+        # job_images 表不吃上面的 IF NOT EXISTS——对缺列旧表幂等补 started_at
+        # （ALTER 无 IF NOT EXISTS 语法，捕获 OperationalError 判重跑）。
+        try:
+            connection.execute("ALTER TABLE job_images ADD COLUMN started_at TEXT")
+        except sqlite3.OperationalError as alter_error:
+            if "duplicate column" not in str(alter_error).lower():
+                raise
         connection.commit()
 
     # ---- 批次 ----
@@ -205,6 +214,11 @@ class JobStore:
                 **column_values,
                 "finished_at": _format_utc(column_values["finished_at"]),
             }
+        if "started_at" in column_values and isinstance(column_values["started_at"], datetime):
+            column_values = {
+                **column_values,
+                "started_at": _format_utc(column_values["started_at"]),
+            }
         if not column_values:
             return
         set_clause = ", ".join(f"{column_name} = ?" for column_name in column_values)
@@ -228,6 +242,36 @@ class JobStore:
                 "UPDATE process_jobs SET status = 'completed'"
                 " WHERE job_id = ? AND status = 'processing'",
                 (job_id,),
+            )
+        return cursor.rowcount > 0
+
+    def try_complete_image(self, image_id: str, **column_values: Any) -> bool:
+        """条件完成回写（2026-08-28 第二十六次修订）：仅当图仍在 processing 时
+        写入 completed 终态字段——终态单向在 DB 层闭环。
+
+        批内并行/重启恢复/TTL 清理的写并发下，recovery 已置 failed 的图
+        不会被管线线程的完成回写覆盖（当年撤回批内并行的竞态根因在此）。
+        返回是否实际写入（False=图已被置为其他终态或已删除，调用方丢弃结果）。
+        """
+        if "stage_results" in column_values and isinstance(column_values["stage_results"], dict):
+            column_values = {
+                **column_values,
+                "stage_results": json.dumps(column_values["stage_results"], ensure_ascii=False),
+            }
+        if "finished_at" in column_values and isinstance(column_values["finished_at"], datetime):
+            column_values = {
+                **column_values,
+                "finished_at": _format_utc(column_values["finished_at"]),
+            }
+        if not column_values:
+            return False
+        set_clause = ", ".join(f"{column_name} = ?" for column_name in column_values)
+        parameters = list(column_values.values()) + [image_id]
+        with self._write_lock, self._get_connection() as connection:
+            cursor = connection.execute(
+                f"UPDATE job_images SET status = 'completed', {set_clause}"
+                " WHERE image_id = ? AND status = 'processing'",
+                parameters,
             )
         return cursor.rowcount > 0
 
@@ -286,5 +330,6 @@ class JobStore:
             stage_results=json.loads(row["stage_results"] or "{}"),
             quality_hint=row["quality_hint"],
             error_msg=row["error_msg"],
+            started_at=_parse_utc(row["started_at"]) if "started_at" in row.keys() else None,
             finished_at=_parse_utc(row["finished_at"]),
         )

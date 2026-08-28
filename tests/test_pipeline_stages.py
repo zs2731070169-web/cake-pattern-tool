@@ -153,12 +153,25 @@ def test_low_res_hint(api_client: TestClient):
     assert image_status["quality_hint"] == "none"
 
 
-def test_batch_isolation_on_corrupt_image(api_client: TestClient, test_settings):
-    """验收 8：批内 1 张坏图 failed，其余 completed 互不影响。"""
+def test_batch_isolation_on_corrupt_image(api_client: TestClient, test_settings, monkeypatch):
+    """验收 8：批内 1 张坏图 failed，其余 completed 互不影响。
+
+    2026-08-28 第二十六次修订并行化改造：原"落盘后轮询抢在读前污染"依赖
+    串行时序，并行下 3 图同时开读追不上——改 monkeypatch 管线读文件入口，
+    seq=2 确定性返回坏字节（不sleep 不竞态，断言语义不变）。
+    """
     good_bytes = build_pattern_png_bytes(width=500, height=500)
     store = api_client.app.state.store
+    pipeline = api_client.app.state.pipeline
 
-    # 建批（2 好 1 坏：坏图用合法 PNG 头过校验，落盘前篡改 in 文件；三张内容各异过查重）
+    real_read = pipeline._read_input_file
+    def read_with_corrupt_seq2(relative_path: str) -> bytes:
+        if relative_path.endswith("in_2.png"):
+            return b"corrupted-by-test"
+        return real_read(relative_path)
+    monkeypatch.setattr(pipeline, "_read_input_file", read_with_corrupt_seq2)
+
+    # 建批（2 好 1 坏：三张内容各异过查重）
     response = api_client.post(
         "/api/jobs",
         files=[
@@ -169,27 +182,11 @@ def test_batch_isolation_on_corrupt_image(api_client: TestClient, test_settings)
     )
     assert response.status_code == 200
     job_id = response.json()["job_id"]
-    # 找到 seq=2（坏图目标）并落盘前污染——轮询等管线开始后覆盖
-    import time
-
-    corrupted = False
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and not corrupted:
-        images = store.get_job_images(job_id)
-        target = next((record for record in images if record.seq == 2), None)
-        if target:
-            input_path = test_settings.resolve_data_dir() / target.input_path
-            if input_path.exists():
-                input_path.write_bytes(b"corrupted-by-test")
-                corrupted = True
-        time.sleep(0.05)
-    assert corrupted, "未能赶在处理前污染坏图"
 
     job_status = wait_until_job_completed(api_client, job_id, timeout_seconds=180)
     statuses = {image["seq"]: image["status"] for image in job_status["images"]}
     assert statuses[1] == "completed"
     assert statuses[3] == "completed"
-    assert statuses[2] in ("failed", "completed")  # 竞态下可能已完成；失败则其余不受影响
-    if statuses[2] == "failed":
-        failed_image = job_status["images"][1]
-        assert failed_image["error_msg"]
+    assert statuses[2] == "failed"  # monkeypatch 确定性触发，不再是竞态二态
+    failed_image = job_status["images"][1]
+    assert failed_image["error_msg"]

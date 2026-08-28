@@ -79,11 +79,19 @@ class FillStep:
         self._gen_cache = FillGenResultCache(settings)
         self._checkerboard_gate = CheckerboardGate(settings)
 
-    def run(self, image_ndarray: np.ndarray, crop_shape: str | None = None) -> FillStepResult:
+    def run(
+        self,
+        image_ndarray: np.ndarray,
+        crop_shape: str | None = None,
+        checkerboard_verdict: bool | None = None,
+    ) -> FillStepResult:
         """背景换白 v18.5 终版路由（5.2 图 B，2026-08-26 用户定案）。
 
         **与形状无关（2026-08-25 定案）**：判定/外呼/缓存全在整图域，
         crop_shape 仅为兼容签名保留。
+        checkerboard_verdict（2026-08-28 第二十六次修订）：管线入口已并行问过
+        棋盘格时直传结果免二次外呼（入口问域=白底合成分析图，与本步一致）；
+        None=未预问，本步照旧自行判定。
         **v18.5 定案**：本地像素判据全线退役（白度/色簇/熵多轮实测效果差），
         改 qwen-vl 视觉问答判定。路由：
         ① 棋盘格背景判定（qwen-vl 问"主体以外的背景是否是棋盘格"——真
@@ -117,8 +125,16 @@ class FillStep:
         module_logger.info(
             "fill start: size=%dx%d 内容占比=%.1f%%", image_width, image_height, content_ratio * 100
         )
-        has_checkerboard = self._checkerboard_gate.has_checkerboard_background(analysis_bgr)
-        module_logger.info("fill: VL 棋盘格判定=%s", has_checkerboard)
+        has_checkerboard = (
+            checkerboard_verdict
+            if checkerboard_verdict is not None
+            else self._checkerboard_gate.has_checkerboard_background(analysis_bgr)
+        )
+        module_logger.info(
+            "fill: VL 棋盘格判定=%s%s",
+            has_checkerboard,
+            "（入口复用，零外呼）" if checkerboard_verdict is not None else "",
+        )
         if not has_checkerboard:
             module_logger.info("fill → skipped（背景非棋盘格，零外呼）")
             return FillStepResult(image_ndarray, "skipped")

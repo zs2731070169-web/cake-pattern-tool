@@ -216,13 +216,17 @@ def test_crop_shape_white_background_outlines_shape(api_client: TestClient):
     center_row = gray_line[200, :]
     circle_edge_left = np.nonzero(center_row[:200])[0]
     assert len(circle_edge_left) > 0, "圆左缘未见灰线"
-    assert abs(circle_edge_left.max() - 12) <= 6, f"灰线应贴内接圆左缘（≈12px），实际 {circle_edge_left.max()}"
+    # 线带起画 = 内接圆缘 + 羽化补偿 2px（第二十五次修订：resize 形状 alpha
+    # 羽化带吃线，起画内缩线宽+2px 厚度画足）——灰线延伸到 ≈12+2px 处
+    assert abs(circle_edge_left.max() - 14) <= 6, f"灰线应贴内接圆左缘内侧（≈14px 含羽化补偿），实际 {circle_edge_left.max()}"
     corner = 20
     assert not gray_line[:corner, :corner].any(), "画布角出现灰线，疑似矩形描边"
 
 
 def test_crop_shape_square_draws_border_frame(api_client: TestClient):
-    """回归：方形裁剪的形状线是画布四边边框带（全图掩膜下"区域−内缩"通式曾产空带）。"""
+    """方形裁剪回归（第二十九次修订口径：square=居中内接正方形掩膜，非全图
+    直通）——300×300 画布上内接正方形恰为全图，四边有边带灰线且角不外凸；
+    square 走"区域−内缩"通式（掩膜非全图后通式产出形状边带）。"""
     white_canvas = np.full((300, 300, 3), 255, dtype=np.uint8)
     cv2.circle(white_canvas, (150, 150), 50, (60, 140, 60), -1)
     response = api_client.post(
@@ -238,21 +242,60 @@ def test_crop_shape_square_draws_border_frame(api_client: TestClient):
     download = api_client.get(image_status["result_url"])
     result_bgr = cv2.imdecode(np.frombuffer(download.content, dtype=np.uint8), cv2.IMREAD_COLOR)
     gray_line = np.all(np.abs(result_bgr.astype(int) - 190) <= 10, axis=2)
-    # 四条边框带都有灰线（内缩一个线宽起笔：默认 1.5mm@300DPI ≈ 18px）
-    assert gray_line[18:36, 100:200].all(), "顶边框带无灰线"
-    assert gray_line[-36:-18, 100:200].all(), "底边框带无灰线"
-    assert gray_line[100:200, 18:36].all(), "左边框带无灰线"
-    assert gray_line[100:200, -36:-18].all(), "右边框带无灰线"
-    # 角不外凸：边框拐角以外的角区（如顶行左端 L 外小块）无灰线——
-    # 边带端点同幅内缩前，竖线顶段会画到行 0-17 形成四角 L 形凸块
-    assert not gray_line[0:17, 0:17].any(), "左上角外凸（边带端点未内缩）"
-    assert not gray_line[0:17, -17:].any(), "右上角外凸"
-    assert not gray_line[-17:, 0:17].any(), "左下角外凸"
-    assert not gray_line[-17:, -17:].any(), "右下角外凸"
-    # 画布最外缘一圈无灰线（防打印裁边）；中心区无灰线
+    # 四条边带都有灰线（边框带构造：内缩一个线宽起笔 18px，带宽 18px→行 18-35）
+    assert gray_line[18:34, 100:200].any(axis=1).all(), "顶边带无灰线"
+    assert gray_line[-34:-18, 100:200].any(axis=1).all(), "底边带无灰线"
+    assert gray_line[100:200, 18:34].any(axis=0).all(), "左边带无灰线"
+    assert gray_line[100:200, -34:-18].any(axis=0).all(), "右边带无灰线"
+    # 角不外凸；画布最外缘一圈无灰线（防打印裁边）；中心区无灰线
+    assert not gray_line[0:17, 0:17].any(), "左上角外凸"
     assert not gray_line[0, :].any() and not gray_line[-1, :].any(), "灰线贴死画布上下边"
     assert not gray_line[:, 0].any() and not gray_line[:, -1].any(), "灰线贴死画布左右边"
     assert not gray_line[100:200, 100:200].any(), "中心区出现灰线"
+
+
+def test_batch_shape_square_rectfixed_nobox_shapes_image(api_client: TestClient):
+    """第二十九次修订核心回归：批级无框 square/rectangle-fixed 声明真实塑形
+    （用户实锤"长方形和正方形设置不到图案上去"——旧矩形类一律整图直通，
+    实测输出 0 像素变化）。400 高×300 宽画布：
+    - square：min 边=300 → 居中 300×300 正方形，上下各 ~50px 透明带；
+    - rectangle-fixed：3:2 横向最大化=300×200 居中，上下各 ~100px 透明带。"""
+    for shape_value in ("square", "rectangle-fixed"):
+        canvas = np.full((400, 300, 3), 255, dtype=np.uint8)
+        cv2.circle(canvas, (150, 200), 60, (60, 140, 60), -1)
+        response = api_client.post(
+            "/api/jobs",
+            files={
+                "images": (
+                    f"{shape_value}.png",
+                    cv2.imencode(".png", canvas)[1].tobytes(),
+                    "image/png",
+                )
+            },
+            data={"crop_meta": json.dumps({"1": {"shape": shape_value}})},
+        )
+        assert response.status_code == 200, response.text
+        job_status = wait_until_job_completed(api_client, response.json()["job_id"])
+        image_status = job_status["images"][0]
+        assert image_status["status"] == "completed", image_status.get("error_msg")
+        assert image_status["stage_results"]["crop_applied"] == "done"
+
+        download = api_client.get(image_status["result_url"])
+        result_bgra = cv2.imdecode(
+            np.frombuffer(download.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+        )
+        assert result_bgra.shape[2] == 4, "塑形交付应带 alpha 通道"
+        alpha = result_bgra[:, :, 3]
+        if shape_value == "square":
+            # 居中 300×300：行 50-349 不透明，顶/底各 50px 透明（留 5px 容差）
+            assert (alpha[:45, :] < 10).all(), "square 顶部未透明（未按 min 边居中塑形）"
+            assert (alpha[-45:, :] < 10).all(), "square 底部未透明"
+            assert (alpha[100:300, 100:200] == 255).all(), "square 中心区应不透明"
+        else:
+            # 3:2 → 300×200 居中：行 100-299 不透明，顶/底各 100px 透明
+            assert (alpha[:95, :] < 10).all(), "rectangle-fixed 顶部未透明（3:2 未生效）"
+            assert (alpha[-95:, :] < 10).all(), "rectangle-fixed 底部未透明"
+            assert (alpha[150:250, 50:250] == 255).all(), "rectangle-fixed 中心区应不透明"
 
 
 def test_crop_shape_unknown_falls_back_to_white_gate(api_client: TestClient):

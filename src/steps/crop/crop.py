@@ -57,17 +57,18 @@ class CropStep:
             return CropStepResult(image_ndarray, "skipped")
         image_bgra = ensure_bgra(image_ndarray)
         if not self._box_valid(box):
-            # 无框合法声明（默认 circle / 旧格式）：整图即框——直接形状塑形
-            # 不裁切（无外接框语义），形状外 alpha=0
-            if shape_value in ("circle", "heart", "star"):
+            # 无框合法声明（批级统一形状的常态，第二十九次修订）：整图即框
+            # ——直接形状塑形不裁切（无外接框语义），形状外 alpha=0（羽化
+            # 抗锯齿口径）。塑形集合 = 全部非 rectangle 形状（square/
+            # rectangle-fixed 居中内接几何在 crop_shape_region_mask 内，
+            # 2026-08-28 修复"正方形/长方形设置不到图案上"）；rectangle/
+            # free = 整图直通（默认值零行为变化）
+            if shape_value != "rectangle" and shape_value != "free":
                 module_logger.info(
                     "crop → done: shape=%s 无框整图塑形 %dx%d",
                     shape_value, image_bgra.shape[1], image_bgra.shape[0],
                 )
-                shape_mask = crop_shape_region_mask(
-                    shape_value, image_bgra.shape[1], image_bgra.shape[0]
-                )
-                image_bgra[:, :, 3] = np.where(shape_mask, image_bgra[:, :, 3], 0)
+                image_bgra = self._apply_shape_mask(image_bgra, shape_value)
             else:
                 module_logger.info("crop → done: shape=%s 矩形无框=整图直通", shape_value)
             return CropStepResult(image_bgra, "done")
@@ -103,12 +104,30 @@ class CropStep:
             "crop → done: shape=%s 框=(%d,%d %dx%d) %dx%d→%dx%d",
             shape_value, x, y, crop_w, crop_h, source_w or image_width, source_h or image_height, crop_w, crop_h,
         )
-        if shape_value in ("circle", "heart", "star"):
-            shape_mask = crop_shape_region_mask(shape_value, crop_w, crop_h)
-            result[:, :, 3] = np.where(shape_mask, result[:, :, 3], 0)
+        if shape_value not in ("rectangle", "free"):
+            # 带框路径的塑形集合同步扩（第二十九次修订）：square/rectangle-fixed
+            # 带框时按框内居中内接塑形（框=外接区，形状掩膜在框幅内最大化）
+            result = self._apply_shape_mask(result, shape_value)
         if image_ndarray.ndim == 3 and image_ndarray.shape[2] == 3:
             return CropStepResult(result[:, :, :3], "done")
         return CropStepResult(result, "done")
+
+    @staticmethod
+    def _apply_shape_mask(image_bgra: np.ndarray, shape_value: str) -> np.ndarray:
+        """形状掩膜塑形（第二十七次修订：自 resize 移入——缩放提前后形状
+        塑形全部由本步在高幅完成）。带 sigma 0.8 羽化抗锯齿（与旧 resize
+        重画口径一致）：光栅圆弧是内接多边形近似，二值边在曲线斜段呈 1px
+        台阶，羽化把台阶过渡成亚像素渐变（打印视觉平滑）。"""
+        import cv2
+
+        from src.steps.outline import crop_shape_region_mask
+
+        shape_mask = crop_shape_region_mask(shape_value, image_bgra.shape[1], image_bgra.shape[0])
+        soft = cv2.GaussianBlur((shape_mask.astype(np.uint8) * 255), (0, 0), sigmaX=0.8)
+        image_bgra[:, :, 3] = np.where(
+            shape_mask, np.maximum(soft, 128), np.minimum(soft, 127)
+        )
+        return image_bgra
 
     @staticmethod
     def _box_valid(box: dict) -> bool:

@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS job_images (
     stage_results TEXT NOT NULL DEFAULT '{}',  -- 各步结果 JSON（watermark/fill/crop/outline/resize/crop_applied）
     quality_hint  TEXT NOT NULL DEFAULT 'none', -- none / heavy-watermark（low-res 已撤 2026-08-27）
     error_msg     TEXT,                    -- 失败原因（仅 failed，脱敏话术）
+    started_at    TEXT,                    -- 开始处理时间（置 processing 时写，UTC ISO；2026-08-28 第二十四次修订——前端"仅执行中计时"数据源）
     finished_at   TEXT                     -- 完成时间
 );
 CREATE INDEX IF NOT EXISTS idx_job_images_job_id

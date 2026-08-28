@@ -36,16 +36,23 @@
     #submit-row button, #restart-row button { font-size: 15px; padding: 10px 32px; }
     @media (max-width: 960px) { #main-grid { grid-template-columns: 1fr; } }
 
-    /* 统一尺寸批量行（2026-08-27 第七次修订；同日位置修订：与标题同行右对齐，
-       独立行撤销——用户标注期望位置 + hint 提示行已删） */
-    .batch-size-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    /* 批级统一设置行（第二十九次修订同日位置再调：标题头下方、上传虚线框
+       上方——先设置后上传的操作顺序；两下拉水平排列收窄宽度；恒显示
+       不随图片显隐（"先上传再设置"隐藏闸已撤，用户定案） */
+    .batch-settings-row {
+      display: flex; align-items: center; flex-wrap: nowrap;
+      gap: 6px; margin-bottom: 10px;
+    }
+    .batch-settings-row .batch-setting-label { font-size: 13px; color: #555; white-space: nowrap; }
     #upload-panel .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
     #upload-panel .panel-head h2 { margin-bottom: 0; }
 
     /* 自绘下拉（2026-08-27 定稿：浮层模式——绝对定位悬浮于选择器下方，
        不顶开任何元素；用户实测"推开内容"版不满意，改回浮层但保留自绘
-       外观与滑出动画。原生 select 弃用原因：选项样式/定位不可控） */
-    .size-dropdown { min-width: 190px; position: relative; }
+       外观与滑出动画。原生 select 弃用原因：选项样式/定位不可控。
+       min-width 190→130：批级两下拉水平排列收窄（第二十九次修订同日），
+       trigger 文案超宽自动撑开） */
+    .size-dropdown { min-width: 130px; position: relative; flex: 0 1 auto; }
     .size-dropdown-trigger {
       width: 100%; text-align: left; background: #fff; border: 1px solid #e5e7eb;
       border-radius: 6px; padding: 4px 10px; font-size: 12px; color: #555;
@@ -132,7 +139,7 @@
     button.danger { color: #c0392b; }
     button.ghost { background: #fff; border: 1px solid #d7dbe2; }
 
-    /* ---- 裁剪弹层 ---- */
+    /* ---- 裁剪弹层（逐图显式裁剪，保留——第二十九次修订：批级形状只是未裁剪图的默认） ---- */
     #crop-modal {
       position: fixed; inset: 0; background: rgba(0,0,0,.75); z-index: 100;
       display: none; flex-direction: column; padding: 12px;
@@ -141,8 +148,6 @@
     #crop-modal .crop-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: #fff; font-size: 14px; }
     #crop-modal .crop-head select, #crop-modal .crop-head input[type=range] { flex: 0 1 auto; }
     #crop-modal select { padding: 4px 8px; border-radius: 6px; border: none; font-size: 13px; }
-    .size-row { margin-top: 4px; }
-    .size-select { padding: 4px 8px; border-radius: 6px; border: 1px solid #e5e7eb; font-size: 12px; background: #fff; color: #555; max-width: 100%; }
     #crop-stage { flex: 1; min-height: 0; margin-top: 10px; }
     #crop-stage img { display: block; max-width: 100%; }
     #crop-modal .crop-foot { display: flex; gap: 10px; margin-top: 10px; }
@@ -155,14 +160,19 @@
       pointer-events: none;
     }
 
-    /* 形状模式：隐藏矩形裁剪框全部附件（边框/手柄/虚线/中线），只留形状遮罩。
+    /* 形状模式：隐藏矩形裁剪框全部附件（边框/边中手柄/虚线/中线），只留形状遮罩。
        矩形框只是 cropperjs 的载体，有效区域是内切形状——附件误导用户以为框角可选 */
     .cropper-crop-box.shape-mode .cropper-view-box { outline: none !important; }
     .cropper-crop-box.shape-mode .cropper-dashed,
     .cropper-crop-box.shape-mode .cropper-center,
     .cropper-crop-box.shape-mode .cropper-line,
     .cropper-crop-box.shape-mode .cropper-point { display: none !important; }
-    /* 缩放锚点：右下角一个可见手柄（形状模式下唯一的尺寸调节入口） */
+    /* 缩放锚点：四角全部可见可拖（第二十九次修订同日放开——原仅右下角，
+       用户定案"四个角都能够拉伸"；aspectRatio 锁定下拖任意角自动保持
+       形状比例，形状遮罩 overlay 随 crop 事件重绘） */
+    .cropper-crop-box.shape-mode .cropper-point.point-nw,
+    .cropper-crop-box.shape-mode .cropper-point.point-ne,
+    .cropper-crop-box.shape-mode .cropper-point.point-sw,
     .cropper-crop-box.shape-mode .cropper-point.point-se {
       display: block !important;
       width: 10px; height: 10px; opacity: .7;
@@ -230,7 +240,7 @@
 <body>
   <header>
     <h1>糯米纸图案自动化修图工具</h1>
-    <p>上传 → 自动去水印 / 填充 / 裁剪 / 变清晰 / 描边 → 下载保存成品</p>
+    <p>上传 → 自动去水印 / 填充 / 变清晰 / 裁剪 / 描边 → 下载保存成品</p>
   </header>
 
   <!-- 双栏主区：左上传（常驻）/ 右结果（常驻，未提交时引导文案） -->
@@ -239,14 +249,21 @@
     <section id="upload-panel">
       <div class="panel-head">
         <h2>1. 选择图片（1–9 张）</h2>
-        <!-- 统一尺寸批量（2026-08-27 自绘下拉：选项从选择器下方滑出推开内容，
-             不再浮层遮挡）：选中即应用到全部待处理图 -->
-        <div class="batch-size-row">
-          <span style="font-size:13px;color:#555;">统一尺寸：</span>
-          <div class="size-dropdown" id="batch-size-dropdown">
-            <button type="button" class="size-dropdown-trigger" id="batch-size-trigger">不设置</button>
-            <div class="size-dropdown-menu"><div class="size-dropdown-menu-inner" id="batch-size-menu"></div></div>
-          </div>
+      </div>
+      <!-- 批级统一设置行（第二十九次修订同日位置再调：标题头下方、上传虚线框
+           上方——设置在先上传在后符合操作顺序；两下拉水平排列收窄宽度；
+           恒显示不随图片显隐——批级值先选好再上传同样成立，用户定案撤销
+           "先上传再设置"隐藏闸） -->
+      <div class="batch-settings-row" id="batch-settings-row">
+        <span class="batch-setting-label">统一形状：</span>
+        <div class="size-dropdown" id="batch-shape-dropdown">
+          <button type="button" class="size-dropdown-trigger" id="batch-shape-trigger">自由矩形（默认）</button>
+          <div class="size-dropdown-menu"><div class="size-dropdown-menu-inner" id="batch-shape-menu"></div></div>
+        </div>
+        <span class="batch-setting-label" style="margin-left: 18px;">统一尺寸：</span>
+        <div class="size-dropdown" id="batch-size-dropdown">
+          <button type="button" class="size-dropdown-trigger" id="batch-size-trigger">不设置</button>
+          <div class="size-dropdown-menu"><div class="size-dropdown-menu-inner" id="batch-size-menu"></div></div>
         </div>
       </div>
       <div id="upload-drop-zone">
@@ -282,7 +299,7 @@
     </section>
   </div>
 
-  <!-- 裁剪弹层（逐图可选，默认收起） -->
+  <!-- 裁剪弹层（逐图显式裁剪，保留——第二十九次修订：批级形状只是未裁剪图的默认） -->
   <div id="crop-modal">
     <div class="crop-head">
       <span>形状：</span>
@@ -315,6 +332,6 @@
 
   <script src="vendor/cropper.min.js"></script>
     <script src="vendor/storezip.js"></script>
-  <script src="app.js?v=20260828"></script>
+  <script src="app.js?v=20260829"></script>
 </body>
 </html>
