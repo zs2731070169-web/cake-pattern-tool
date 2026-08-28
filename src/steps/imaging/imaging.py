@@ -88,3 +88,30 @@ def encode_png(bgr_ndarray: np.ndarray) -> bytes:
     if not encode_success:
         raise ImageDecodeError("PNG 编码失败")
     return png_buffer.tobytes()
+
+
+def atomic_write_png(cache_path, bgr_ndarray: np.ndarray) -> None:
+    """缓存原子写（2026-08-28 第二十六次修订）：内存编码 + 唯一临时文件 +
+    os.replace 落位——并发读者永不见半张 PNG。
+
+    批内并行后同键并发写是常态：cv2.imwrite 直写非原子，读到缺 IEND 的
+    半张图会被 get() 判未命中→多花一次外呼。os.replace 同文件系统原子；
+    临时名带 uuid 防两写者互踩。编码失败/IO 失败抛 OSError（调用方记日志
+    不影响主流程，与旧 put 语义一致）。
+    """
+    import os
+    import uuid
+    from pathlib import Path
+
+    target = Path(cache_path)
+    encoded = encode_png(bgr_ndarray)  # 编码在内存做：失败时目标文件不受影响
+    temp_path = target.with_name(f"{target.name}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        temp_path.write_bytes(encoded)
+        os.replace(temp_path, target)
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise

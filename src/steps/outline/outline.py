@@ -41,6 +41,11 @@ MIN_PATTERN_AREA_RATIO = 0.05  # 连通块面积达主图案 5% 以上才描（�
 MIN_PATTERN_AREA_PIXELS = 25  # 碎屑绝对下限（灰尘点/压缩噪点不分图幅一律丢弃）
 OUTLINE_SMOOTH_KERNEL = 7  # 轮廓平滑：开/闭运算核（去毛刺与豁口）
 OUTLINE_SMOOTH_BLUR_SIGMA = 4.0  # 轮廓平滑：高斯模糊 σ（圆滑像素级阶梯锯齿）
+# 形状边羽化补偿（2026-08-28 第二十五次修订）：resize 形状 alpha 重画的
+# sigma 0.8 羽化使边界内 ~2px 是 alpha<255 过渡带；描边只落 alpha==255
+# 硬区——线带最外 1-2px 被羽化吃掉（幅面越大占比越高）。起画内缩线宽
+# +此补偿，厚度按线宽参数画足，物理线宽回到参数值。
+SHAPE_EDGE_FEATHER_COMPENSATION_PX = 2
 
 
 def edge_band_pixels(image_ndarray: np.ndarray) -> np.ndarray:
@@ -242,10 +247,37 @@ def crop_shape_region_mask(shape_value: str, width: int, height: int) -> np.ndar
     - circle：内接圆 r=min/2（圆对称，无变化）；
     - heart：scale = min(W/32, H/28.9)，y 垂直居中（公式 y 中心 ≈2.55）；
     - star：顶点朝上包围盒宽 1.9r，r = min(W,H)/1.9（宽贴边）。
+
+    2026-08-28 第二十九次修订：square/rectangle-fixed 从"全图掩膜"改为
+    **居中内接**（square=min 边正方形、rectangle-fixed=3:2 矩形，宽高比与
+    弹层 SHAPE_ASPECT_RATIOS 同源）——批级无框声明下"选了形状就该看得见
+    形状"（旧矩形类一律全图=直通，用户实锤"正方形/长方形设置不到图案上"）。
+    rectangle（自由矩形）仍全图（默认直通零变化）；带框路径不受影响（框
+    裁外接区后矩形类=裁框本身，不走本函数）。
     """
     canvas = np.zeros((height, width), np.uint8)
+    if shape_value == "square":
+        side = min(width, height)
+        left = (width - side) // 2
+        top = (height - side) // 2
+        canvas[top : top + side, left : left + side] = 1
+        return canvas > 0
+    if shape_value == "rectangle-fixed":
+        # 3:2 长方形居中最大化：先按"宽=高×1.5"假设，越幅则按"高=宽/1.5"反推
+        # （宽高比 1.5 与前端 SHAPE_ASPECT_RATIOS['rectangle-fixed'] 同源）
+        aspect_ratio = 1.5
+        if round(height * aspect_ratio) <= width:
+            rect_h = height
+            rect_w = round(height * aspect_ratio)
+        else:
+            rect_w = width
+            rect_h = round(width / aspect_ratio)
+        left = (width - rect_w) // 2
+        top = (height - rect_h) // 2
+        canvas[top : top + rect_h, left : left + rect_w] = 1
+        return canvas > 0
     if shape_value in RECTANGLE_LIKE_SHAPES:
-        canvas[:, :] = 1  # 矩形类：图幅边界即形状边界
+        canvas[:, :] = 1  # rectangle/free：图幅边界即形状边界（直通）
         return canvas > 0
     center_x, center_y = width / 2, height / 2
     if shape_value == "circle":
@@ -303,7 +335,9 @@ def draw_shape_outline(
     # 被渗出颜色"绕过"（用户真图实锤：隔离带出现 134-191 深色图案内容）。
     # 画线前把解析掩膜外的颜色像素洗白，恢复线-边界隔离带；与 resize 内
     # alpha 解析重画同构（形状内图案无损，只清渗出伪影）。
-    if shape_value not in RECTANGLE_LIKE_SHAPES:
+    if shape_value not in ("rectangle", "free"):
+        # 形状外颜色清洗（第二十一次修订 + 第二十九次修订扩集合）：square/
+        # rectangle-fixed 的掩膜不再全图，形状外同样需要清洗渗出伪影
         outside = ~shape_mask
         bleed = outside & (image_bgra[:, :, :3] < 248).any(axis=2)
         if bleed.any():
@@ -313,23 +347,37 @@ def draw_shape_outline(
             )
 
     if shape_value in RECTANGLE_LIKE_SHAPES:
-        # 矩形类：形状区域=整个画布，"区域−内缩"求边界带的通式对全图掩膜失效
-        # （全图腐蚀仍全图→空带），直接构造四条边框带；内缩一个线宽防打印裁边。
-        # 端点同幅内缩：边带的行/列区间也从 inset 起止——整行整列写会在四角
-        # 多出 L 形凸块（竖线顶段/横线端头超出边框拐角）。
+        # 矩形类（含 square/rectangle-fixed，第二十九次修订）：形状区域是轴对齐
+        # 矩形（rectangle/free=全图，square/rectangle-fixed=居中内接），"区域−
+        # 内缩"通式对矩形掩膜产出的带贴最外缘（行/列 0 起笔）——丢失旧口径
+        # "内缩一个线宽防打印裁边"。统一走边框带构造：按掩膜有效区定框，四条
+        # 边带内缩一个线宽。端点同幅内缩：边带的行/列区间也从 inset 起止——
+        # 整行整列写会在四角多出 L 形凸块（竖线顶段/横线端头超出边框拐角）。
+        active_rows = np.nonzero(shape_mask.any(axis=1))[0]
+        active_cols = np.nonzero(shape_mask.any(axis=0))[0]
+        if len(active_rows) == 0 or len(active_cols) == 0:  # 防御：空掩膜不画线
+            return image_ndarray
+        top_edge = int(active_rows.min())
+        bottom_edge = int(active_rows.max()) + 1
+        left_edge = int(active_cols.min())
+        right_edge = int(active_cols.max()) + 1
         frame_band = np.zeros((image_height, image_width), dtype=bool)
         inset = line_thickness
-        span_rows = (inset, image_height - inset)  # 边带行/列的起止（含）
-        span_cols = (inset, image_width - inset)
-        frame_band[inset:inset + line_thickness, span_cols[0]:span_cols[1]] = True  # 顶
-        frame_band[image_height - inset - line_thickness:image_height - inset, span_cols[0]:span_cols[1]] = True  # 底
-        frame_band[span_rows[0]:span_rows[1], inset:inset + line_thickness] = True  # 左
-        frame_band[span_rows[0]:span_rows[1], image_width - inset - line_thickness:image_width - inset] = True  # 右
+        span_rows = (top_edge + inset, bottom_edge - inset)  # 边带行/列的起止（含）
+        span_cols = (left_edge + inset, right_edge - inset)
+        frame_band[top_edge + inset : top_edge + inset + line_thickness, span_cols[0]:span_cols[1]] = True  # 顶
+        frame_band[bottom_edge - inset - line_thickness : bottom_edge - inset, span_cols[0]:span_cols[1]] = True  # 底
+        frame_band[span_rows[0]:span_rows[1], left_edge + inset : left_edge + inset + line_thickness] = True  # 左
+        frame_band[span_rows[0]:span_rows[1], right_edge - inset - line_thickness : right_edge - inset] = True  # 右
         line_band = frame_band & usable
     else:
+        # 内缩量 = 线宽 + 羽化补偿（第二十五次修订）：resize 形状 alpha 的
+        # sigma 0.8 羽化带（边界内 ~2px 半透明）会把线带最外像素排除在
+        # alpha==255 硬区外——内缩起画位置让整条线宽画足（见常量注释）
+        band_depth = line_thickness + SHAPE_EDGE_FEATHER_COMPENSATION_PX
         shrink_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
-            (2 * line_thickness + 1, 2 * line_thickness + 1),
+            (2 * band_depth + 1, 2 * band_depth + 1),
         )
         inner_mask = _erode_zero_border(shape_mask.astype(np.uint8), shrink_kernel) > 0
         line_band = shape_mask & ~inner_mask & usable

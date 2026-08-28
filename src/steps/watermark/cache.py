@@ -43,11 +43,14 @@ class WatermarkResultCache:
         return cached
 
     def put(self, analysis_bgr: np.ndarray, repaired_bgr: np.ndarray) -> None:
-        """写入缓存（目录自动创建；写失败只记日志不影响主流程）。"""
+        """写入缓存（原子写：内存编码+临时文件+rename，2026-08-28 第二十六次
+        修订——并发读者永不见半张 PNG；写失败只记日志不影响主流程）。"""
+        from src.steps.imaging import atomic_write_png
+
         cache_path = self._cache_path(self.key_of(analysis_bgr))
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(cache_path), repaired_bgr)
+            atomic_write_png(cache_path, repaired_bgr)
         except OSError as cache_error:
             module_logger.warning("watermark cache write failed: %s", cache_error)
 

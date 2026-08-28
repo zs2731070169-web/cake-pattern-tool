@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from concurrent.futures import ThreadPoolExecutor
 
@@ -22,7 +21,7 @@ import numpy as np
 from src.core.config import PatternToolSettings
 from src.jobs.store import JobImageRecord, JobStore, utc_now
 from src.steps.fill.filling import FillStep
-from src.steps.imaging import ImageDecodeError, decode_to_ndarray, encode_png
+from src.steps.imaging import ImageDecodeError, decode_to_ndarray, encode_png, ensure_bgra
 from src.steps.outline import OutlineStep
 from src.steps.watermark import WatermarkStep
 
@@ -42,12 +41,11 @@ class RetouchPipeline:
         self._fill_step = FillStep(settings)
         self._outline_step = OutlineStep(settings)
 
-        # 全局并发上限：同时 processing 图 ≤ 2×核数（0 表示自动，6 节容量防线）
-        max_concurrency = settings.max_concurrent_processing or (2 * (os.cpu_count() or 2))
-        self._processing_semaphore = threading.Semaphore(max_concurrency)
-
         # 图片处理主池：core 全局单例（2026-08-26 重构——多管线实例共享，
-        # 配额统一；批内并行子池仍按批短生命周期创建不入单例）
+        # 配额统一）。并发上限 = executor max_workers = max_concurrent_processing
+        # （0=自动 2×CPU，6 节容量防线；2026-08-28 第二十六次修订删
+        # _processing_semaphore——旧"信号量阻塞等位"占住 worker 干等排队，
+        # 排队超时改投递时刻 deadline 检查，并发闸由 worker 数直接承担）
         from src.core.executor import get_image_executor
 
         self._image_executor = get_image_executor(settings)
@@ -55,8 +53,20 @@ class RetouchPipeline:
     # ---- 对外入口 ----
 
     def submit_job(self, job_id: str) -> None:
-        """受理一个批次：逐图投递执行（立即返回，不阻塞 API 响应）。"""
-        self._image_executor.submit(self._run_job, job_id)
+        """受理一个批次：逐图投递执行（立即返回，不阻塞 API 响应）。
+
+        2026-08-28 第二十六次修订：批内图并行——每图一个 executor 任务，
+        撤 2026-08-26 串行定案（当年翻车根因是无条件完成回写竞态，
+        try_complete_image 条件更新已在 DB 层闭环，非并行本身之罪）。
+        enqueue 时间随任务入参传递，排队超时在任务启动时判定。
+        """
+        try:
+            images = self._store.get_job_images(job_id)
+        except Exception:
+            module_logger.exception("job %s submit failed: cannot read images", job_id)
+            return
+        for image_record in images:
+            self._image_executor.submit(self._run_single_image, image_record, utc_now())
 
     def shutdown(self) -> None:
         """优雅关闭（测试与退出用；主池是 core 单例不在此关，见 main.py lifespan）。"""
@@ -64,75 +74,16 @@ class RetouchPipeline:
 
     # ---- 内部编排 ----
 
-    def _run_job(self, job_id: str) -> None:
-        """批次入口：批内图片串行处理（2026-08-26 21:58 用户定案撤回批内并行——
-        并行使悬挂图状态回写与 recovery/TTL 产生竞态（test_startup_recovery
-        偶发 'processing' != 'failed'），多任务优化方案将重新设计）。
-        批次间仍并行（每个 job 一个 executor 任务），全局闸 Semaphore 不变。
-        """
+    def _run_single_image(self, image_record: JobImageRecord, enqueued_at) -> None:
+        """单图任务（批内并行，每图独立失败隔离 + 终态后聚合批次状态）。"""
         try:
-            images = self._store.get_job_images(job_id)
-            for image_record in images:
-                self._process_single_image(image_record)
-            self._store.complete_job_if_done(job_id)
-        except Exception as job_error:  # 批次级兜底：不遗留 processing 悬挂
-            module_logger.exception("job %s orchestration failed", job_id)
-            remaining = self._store.get_job_images(job_id)
-            for image_record in remaining:
-                if image_record.status in ("queued", "processing"):
-                    self._mark_failed(image_record.image_id, GENERIC_FAILURE_MESSAGE)
-
-    def _process_single_image(self, image_record: JobImageRecord) -> None:
-        """单图全流程：排队 → 处理（60s 软超时）→ 终态回写。"""
-        acquired = self._processing_semaphore.acquire(timeout=self._settings.image_queue_timeout_seconds)
-        if not acquired:
-            # 排队超 10 分钟：置 failed 提示错峰（排队段超时口径，6 节）
-            self._mark_failed(image_record.image_id, QUEUE_TIMEOUT_MESSAGE)
-            return
-        try:
-            self._store.update_image(image_record.image_id, status="processing")
-            process_start_timestamp = utc_now()
-
-            image_bytes = self._read_input_file(image_record.input_path)
-            # 原始未裁剪域（去水印缓存域，4.4）：前端裁剪过的图带 orig_{seq}.png
-            original_bytes = self._read_optional_file(
-                self._original_relative_path(image_record)
-            )
-            result_bytes, stage_results, quality_hint = self._run_steps_with_timeout(
-                image_bytes, image_record.stage_results.get("crop"), original_bytes
-            )
-
-            result_relative_path = self._write_result_file(
-                image_record.job_id, image_record.seq, result_bytes
-            )
-            # 放大失败整图 failed 不交付（2026-08-28 第十七次修订，用户定案
-            # "失败了就失败了"）：插值废图不产出——超分失败说明该图放大后
-            # 不可用，客户提示换更清晰原图比拿废图强（与去水印 failed 同构）
-            if stage_results.get("resize") == "failed":
-                self._mark_failed(
-                    image_record.image_id,
-                    "图片放大后清晰度不足，请提供更清晰的原图重试",
-                )
+            queued_seconds = (utc_now() - enqueued_at).total_seconds()
+            if queued_seconds > self._settings.image_queue_timeout_seconds:
+                # 排队超 10 分钟：置 failed 提示错峰（6 节排队段超时口径；
+                # 旧"信号量 acquire(timeout) 阻塞等位"的 deadline 等价迁移）
+                self._mark_failed(image_record.image_id, QUEUE_TIMEOUT_MESSAGE)
                 return
-            elapsed_seconds = (utc_now() - process_start_timestamp).total_seconds()
-            if elapsed_seconds > self._settings.image_process_timeout_seconds:
-                # 超时图不入成品（软超时兜底：步骤已完成但整体超预算也按失败）
-                self._mark_failed(image_record.image_id, "处理超时，请稍后重试")
-                return
-
-            self._store.update_image(
-                image_record.image_id,
-                status="completed",
-                stage_results=stage_results,
-                quality_hint=quality_hint,
-                result_path=result_relative_path,
-                finished_at=utc_now(),
-            )
-            module_logger.info(
-                "image done job=%s image=%s seq=%s stages=%s hint=%s elapsed=%.1fs",
-                image_record.job_id, image_record.image_id, image_record.seq,
-                stage_results, quality_hint, elapsed_seconds,
-            )
+            self._process_single_image(image_record)
         except ImageDecodeError as decode_error:
             self._mark_failed(image_record.image_id, str(decode_error))
         except Exception:
@@ -141,7 +92,67 @@ class RetouchPipeline:
             )
             self._mark_failed(image_record.image_id, GENERIC_FAILURE_MESSAGE)
         finally:
-            self._processing_semaphore.release()
+            # 每图终态各触发一次聚合判定：COUNT=0 才置批 completed——
+            # 并发下幂等（UPDATE WHERE status='processing' + rowcount）
+            self._store.complete_job_if_done(image_record.job_id)
+
+    def _process_single_image(self, image_record: JobImageRecord) -> None:
+        """单图全流程：置 processing → 五步（180s 软超时）→ 终态回写。"""
+        process_start_timestamp = utc_now()
+        # started_at 随 processing 一并落库（2026-08-28 第二十四次修订）：
+        # 前端"仅执行中计时"的服务端真值锚点——排队等待天然排除在外
+        self._store.update_image(
+            image_record.image_id, status="processing", started_at=process_start_timestamp
+        )
+
+        image_bytes = self._read_input_file(image_record.input_path)
+        # 原始未裁剪域（去水印缓存域，4.4）：前端裁剪过的图带 orig_{seq}.png
+        original_bytes = self._read_optional_file(
+            self._original_relative_path(image_record)
+        )
+        result_bytes, stage_results, quality_hint = self._run_steps_with_timeout(
+            image_bytes, image_record.stage_results.get("crop"), original_bytes
+        )
+
+        result_relative_path = self._write_result_file(
+            image_record.job_id, image_record.seq, result_bytes
+        )
+        # 放大失败整图 failed 不交付（2026-08-28 第十七次修订，用户定案
+        # "失败了就失败了"）：插值废图不产出——超分失败说明该图放大后
+        # 不可用，客户提示换更清晰原图比拿废图强（与去水印 failed 同构）
+        if stage_results.get("resize") == "failed":
+            self._mark_failed(
+                image_record.image_id,
+                "图片放大后清晰度不足，请提供更清晰的原图重试",
+            )
+            return
+        elapsed_seconds = (utc_now() - process_start_timestamp).total_seconds()
+        if elapsed_seconds > self._settings.image_process_timeout_seconds:
+            # 超时图不入成品（软超时兜底：步骤已完成但整体超预算也按失败）
+            self._mark_failed(image_record.image_id, "处理超时，请稍后重试")
+            return
+
+        # 条件完成回写（第二十六次修订）：WHERE status='processing'——
+        # 与 recovery/TTL 置的 failed 竞态输掉时整图丢弃（out 文件成孤儿
+        # 由 TTL 24h 清理），终态单向在 DB 层闭环
+        completed = self._store.try_complete_image(
+            image_record.image_id,
+            stage_results=stage_results,
+            quality_hint=quality_hint,
+            result_path=result_relative_path,
+            finished_at=utc_now(),
+        )
+        if completed:
+            module_logger.info(
+                "image done job=%s image=%s seq=%s stages=%s hint=%s elapsed=%.1fs",
+                image_record.job_id, image_record.image_id, image_record.seq,
+                stage_results, quality_hint, elapsed_seconds,
+            )
+        else:
+            module_logger.warning(
+                "image complete lost race job=%s image=%s（终态已被并发写入，结果丢弃）",
+                image_record.job_id, image_record.image_id,
+            )
 
     def _run_steps_with_timeout(
         self, image_bytes: bytes, crop_meta_json: str | None = None, original_bytes: bytes | None = None
@@ -206,24 +217,32 @@ class RetouchPipeline:
         # 跑不跑由自身业务条件决定：没水印→skipped、非棋盘格→skipped、
         # 未配 key→降级；单步调试用各步开关单开等价达成。）
 
-        # ---- 双判定前移 + 合并调用（2026-08-26 定案）----
-        # 在**原始图**上并行两问 qwen-vl：①有无水印 ②棋盘格背景。双 true 时
-        # 一次 qwen-image 合并生成（去水印+格子换白一次出图）——去水印生成会
-        # 重绘棋盘格背景致填充判定失效（03:30 实测翻车），合并消除该冲突。
-        # stage_results 双键分开记档（watermark=done(api) + fill=白色背景）——
-        # 步骤契约不合并；成本算 watermark 侧。失败回退两步各自原路径。
-        # ---- 棋盘格顺序门（2026-08-26 方案A'：两步职责纯净，只换顺序）----
-        # 原始图问 VL 棋盘格：true → 填充先行（格子→纯白；白底不怕后续
-        # 去水印的二次生成——本来就要它纯白）再去残留水印；false → 正常
-        # 顺序（正常顺序下去水印会重绘棋盘格致填充判定失效，03:30 翻车）。
-        wm_first = not self._is_checkerboard_image(image_bgr)
+        # ---- 入口双 VL 并行 + 判定复用（2026-08-28 第二十六次修订）----
+        # 两个链头问答都以原始图白底合成分析图为输入且互不依赖：棋盘格判定
+        # （定顺序门）与水印预检（定是否修复）在随图建的 2-worker 短命池
+        # 并发发起——旧路径串行问 2-3 次（顺序门一次 + FillStep 内部同问题
+        # 一次 + 预检一次），单图省 0.8-20s 串行段 + 1-2 次外呼费用。
+        # 判定复用路由：
+        # - 正常顺序（非棋盘格）：预检结果直传 WatermarkStep（入口与本步同在
+        #   原始图域，域精确）；棋盘格判定直传 FillStep（水印修复只重绘水印
+        #   区不引入棋盘格，近似成立）。
+        # - fill-first（棋盘格 true）：入口棋盘格判定直传 FillStep（同图域
+        #   精确）；入口预检结果**丢弃**（换白生成重绘背景，原图域答案对
+        #   生成图不成立），WatermarkStep 照旧自问。
+        # 失败语义逐条保留：棋盘格失败按 False 走正常顺序、预检失败按 None
+        # 走 skipped 零误伤（步骤内部各自兜底）。
+        entry_checkerboard, entry_precheck = self._ask_entry_verdicts(image_bgr)
+        wm_first = entry_checkerboard is not True  # None（未配/失败）→ 正常顺序
         ordered_steps = ["watermark", "fill"] if wm_first else ["fill", "watermark"]
 
         for step_name in ordered_steps:
             if step_name == "watermark":
                 # 去水印——管线已在原始域，修复结果即原图域整幅直传下一步
                 # （不按 crop 偏移裁窗映射：旧架构遗留会致往返缩放画质损失）。
-                watermark_result = self._watermark_step.run(image_bgr)
+                watermark_result = self._watermark_step.run(
+                    image_bgr,
+                    precheck_verdict=entry_precheck if wm_first else None,
+                )
                 image_bgr = watermark_result.image_bgr
                 stage_results["watermark"] = watermark_result.stage_value
                 if watermark_result.quality_hint == "heavy-watermark":
@@ -231,34 +250,17 @@ class RetouchPipeline:
             else:
                 # 填充（形状无关——判定/外呼/缓存全在整图域，2026-08-25 定案；
                 # 原始域下同图不同形状同键，模型只调一次）
-                fill_result = self._fill_step.run(image_bgr)
+                fill_result = self._fill_step.run(
+                    image_bgr, checkerboard_verdict=entry_checkerboard
+                )
                 image_bgr = fill_result.image_bgr
                 stage_results["fill"] = fill_result.stage_value
 
-        # 步 3：裁剪（CropStep，2026-08-26 独立 step）——按声明运行时执行：
-        # 框裁外接区 + 形状掩膜塑形。原始域下框坐标有效；裁剪版域退化塑形。
-        # crop_enabled=false（2026-08-28 第二十次修订）→ 不裁框不塑形原图
-        # 直通，skipped 记档（下游形状描边/缩放形状重画随声明缺失自然退化）。
-        from src.steps.crop import CropStep, CropStepResult
-
-        if self._settings.crop_enabled:
-            crop_result = CropStep().run(image_bgr, crop_meta_for_crop)
-            image_bgr = crop_result.image_bgr
-        else:
-            module_logger.info("crop: 配置关闭（PT_CROP_ENABLED=false）→ 原图直通")
-            crop_result = CropStepResult(image_bgr, "skipped")
-        # 记档约定：crop 字段始终记声明 JSON（含 shape 供前端回显/排查），
-        # 执行与否看 resize 等下游是否收到塑形图；无声明才记 "skipped"。
-        # （2026-08-26 14:49 起 CropStep 对无框合法声明也执行塑形——
-        # "每图必有形状"兑现，形状外真 transparent）
-        stage_results["crop"] = crop_meta_json or "skipped"
-        if crop_result.stage_value != "skipped":
-            stage_results["crop_applied"] = crop_result.stage_value
-
-        # 步 4：尺寸缩放（2026-08-28 第十九次修订前置——原步 5 提前：
-        # 描边必须在目标幅直画，避免佐糖定倍+尾程非常规倍率链拉伸灰线
-        # 导致锯齿与线宽物理漂移；见下方描边步注释）。按 crop_meta.size.cm
-        # 声明缩放到 @300DPI 目标短边；放大走佐糖 scale-pro 变清晰（非裸插值）。
+        # 步 3：尺寸缩放（2026-08-28 第二十七次修订：缩放提前到裁剪之前）——
+        # 送佐糖的是"去水印+填充后"的原始域图（裁剪前），超分缓存键（图内容
+        # SHA-256+目标宽）不随形状/裁剪框变化：同图二次提交跨形状命中，零重复
+        # 外呼（旧顺序裁剪先行，缓存键随形状变化——同图 4 次提交 3 次外呼的
+        # 超分版）。描边仍在缩放后目标幅直画（第十九次修订口径不变）。
         size_cm = None
         if crop_meta and isinstance(crop_meta.get("size"), dict):
             try:
@@ -267,8 +269,7 @@ class RetouchPipeline:
                 size_cm = None
         from src.steps.resize import ResizeStep
 
-        resize_shape = crop_shape if crop_shape in ("circle", "heart", "star") else None
-        resize_result = ResizeStep(self._settings).run(image_bgr, size_cm, resize_shape)
+        resize_result = ResizeStep(self._settings).run(image_bgr, size_cm)
         image_bgr = resize_result.image_bgr
         stage_results["resize"] = resize_result.stage_value
 
@@ -288,6 +289,30 @@ class RetouchPipeline:
         if resize_result.quality_hint == "suggest-larger-source":
             quality_hint = "suggest-larger-source"
 
+        # 步 4：裁剪（CropStep，2026-08-26 独立 step；第二十七次修订移到
+        # 缩放之后）——在放大图上运行时执行：框坐标按 frame→当前幅等比映射
+        # （框语义=原图上的区域选择，随幅等比缩放，crop.py 原有映射逻辑天然
+        # 兼容），形状掩膜高幅塑形（解析几何任意分辨率无损）。形状掩膜重画
+        # 自本修订起全部由裁剪步承担（旧 resize 的 shape_value 重画参数退役
+        # ——缩放时还不知道裁剪结果）。
+        # crop_enabled=false（2026-08-28 第二十次修订）→ 不裁框不塑形原图
+        # 直通，skipped 记档（下游形状描边随声明缺失自然退化）。
+        from src.steps.crop import CropStep, CropStepResult
+
+        if self._settings.crop_enabled:
+            crop_result = CropStep().run(image_bgr, crop_meta_for_crop)
+            image_bgr = crop_result.image_bgr
+        else:
+            module_logger.info("crop: 配置关闭（PT_CROP_ENABLED=false）→ 原图直通")
+            crop_result = CropStepResult(image_bgr, "skipped")
+        # 记档约定：crop 字段始终记声明 JSON（含 shape 供前端回显/排查），
+        # 执行与否看下游收到的图；无声明才记 "skipped"。
+        # （2026-08-26 14:49 起 CropStep 对无框合法声明也执行塑形——
+        # "每图必有形状"兑现，形状外真 transparent）
+        stage_results["crop"] = crop_meta_json or "skipped"
+        if crop_result.stage_value != "skipped":
+            stage_results["crop_applied"] = crop_result.stage_value
+
         # 步 5：描边（2026-08-28 第十九次修订——管线最末步，目标幅直画：
         # 线宽 px = mm×DPI/25.4 在交付幅精确落地，零拉伸零振铃；旧顺序
         # [描边@源幅→缩放] 在佐糖服务端定倍 ×5.7+尾程 ×1.53 非常规倍率链下
@@ -300,22 +325,47 @@ class RetouchPipeline:
 
         return encode_png(image_bgr), stage_results, quality_hint
 
-    def _is_checkerboard_image(self, image_bgr: np.ndarray) -> bool:
-        """棋盘格顺序门（2026-08-26 方案A'）：原始图问 VL 背景，true 则
-        管线顺序换为填充→去水印。两步职责纯净；判定失败按 False 走正常
-        顺序（去水印→填充）。"""
-        from src.steps.fill.gate_vl import CheckerboardGate
+    def _ask_entry_verdicts(self, image_bgr: np.ndarray) -> tuple[bool | None, bool | None]:
+        """入口双 VL 并行问（2026-08-28 第二十六次修订）。
 
-        try:
-            gate = CheckerboardGate(self._settings)
-            if not gate.is_configured():
-                return False
-            verdict = gate.has_checkerboard_background(image_bgr)
-            module_logger.debug("checkerboard order gate: %s", verdict)
-            return verdict
-        except Exception as gate_error:
-            module_logger.warning("checkerboard gate error: %s", gate_error)
-            return False
+        同一张白底合成分析图上并发两问：棋盘格判定（顺序门 + FillStep 复用）
+        与水印预检（WatermarkStep 复用）。返回 (checkerboard, precheck)：
+        - 未配置 key → (None, None)（两步各自按 skipped 降级，零外呼）；
+        - 单问失败 → 该问按 None/False 语义降级（棋盘格失败=False 走正常
+          顺序由调用侧 is not True 处理；预检失败=None 按无水印零误伤）。
+        http_sync 阻塞调用线程——两问必须两个 OS 线程各持一发（随图建的
+        2-worker 短命池，finally 收口不入单例，与 retouch-steps 壳同纪律）。
+        """
+        from src.steps.fill.gate_vl import CheckerboardGate
+        from src.steps.imaging import flatten_to_white
+        from src.steps.watermark.precheck import WatermarkPrecheck
+
+        analysis_bgr = flatten_to_white(ensure_bgra(image_bgr))  # 问域统一：FillStep 标定 4/4 的域
+        gate = CheckerboardGate(self._settings)
+        precheck = WatermarkPrecheck(self._settings)
+        if not gate.is_configured():
+            return None, None  # 两问共用 wm_precheck 配置（key 同源）
+
+        def ask_checkerboard() -> bool | None:
+            try:
+                return gate.has_checkerboard_background(analysis_bgr)
+            except Exception as gate_error:
+                module_logger.warning("checkerboard gate error: %s", gate_error)
+                return False  # 失败按非棋盘格走正常顺序（零误伤语义）
+
+        def ask_precheck() -> bool | None:
+            try:
+                return precheck.has_watermark(analysis_bgr)
+            except Exception as precheck_error:
+                module_logger.warning("entry precheck error: %s", precheck_error)
+                return None  # 失败按无水印（步骤侧 skipped 零误伤）
+
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="vl-gate") as pool:
+            checkerboard_future = pool.submit(ask_checkerboard)
+            precheck_future = pool.submit(ask_precheck)
+            return checkerboard_future.result(), precheck_future.result()
 
     @staticmethod
     def _parse_crop_meta(crop_meta_json: str | None) -> dict | None:
