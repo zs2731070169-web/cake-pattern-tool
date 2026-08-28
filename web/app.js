@@ -565,21 +565,31 @@
     });
   }
 
-  // 未裁剪图的批级形状预览：整图按形状合成（复用 attachCroppedPreview 的
-  // 声明合成管线——整图框 + 形状 clip），所见即后端整图塑形结果
+  // 未裁剪图的批级形状预览：整图按形状合成——与后端 CropStep 同几何：
+  // 居中补方到正方形（第三十五次修订）再形状满幅 clip，所见即后端塑形结果
   function attachShapeOnlyPreview(imgElement, item, itemIndex) {
     loadIntoImageElement(item.originalFile).then(function (imageEl) {
       if (pendingImages[itemIndex] !== item) return; // 列表已变（移除/重排）
       var natural = { w: imageEl.naturalWidth, h: imageEl.naturalHeight };
       if (natural.w < 1 || natural.h < 1) return;
       var supersample = 2; // 小缩略图形状边缘抗锯齿（与声明预览同口径）
+      // 补方（第三十五次修订对齐）：画布=max 边正方形，原图居中——形状
+      // 满幅内接（circle 直径=方形边长），不再跟原图宽高比走
+      var side = Math.max(natural.w, natural.h);
+      var canvasSide = side * supersample;
       var previewCanvas = document.createElement('canvas');
-      previewCanvas.width = natural.w * supersample;
-      previewCanvas.height = natural.h * supersample;
+      previewCanvas.width = canvasSide;
+      previewCanvas.height = canvasSide;
       var ctx = previewCanvas.getContext('2d');
-      buildShapePath(ctx, batchCropShape, previewCanvas.width, previewCanvas.height);
+      buildShapePath(ctx, batchCropShape, canvasSide, canvasSide);
       ctx.clip();
-      ctx.drawImage(imageEl, 0, 0, previewCanvas.width, previewCanvas.height);
+      ctx.drawImage(
+        imageEl,
+        (canvasSide - natural.w * supersample) / 2,
+        (canvasSide - natural.h * supersample) / 2,
+        natural.w * supersample,
+        natural.h * supersample
+      );
       imgElement.src = previewCanvas.toDataURL('image/png');
     }).catch(function () { /* 预览失败保持原图，不阻塞 */ });
   }
