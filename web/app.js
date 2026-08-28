@@ -1,7 +1,7 @@
 /* pattern-tool 前端逻辑：上传预压 → 批级形状/尺寸设置（+逐图可选裁剪弹层）→ 提交轮询 → 分端交付。
    技术方案 7.1：无构建链原生 JS；预压用 canvas；Web Share / ClipboardItem 特性检测降级。
-   第二十九次修订：批级"统一形状"自绘下拉（默认自由矩形）——未显式裁剪的图提交时以
-   批级形状为默认声明（无框，后端 CropStep 整图塑形/直通承接）；显式裁剪优先。 */
+   第二十九次修订：批级"统一形状"自绘下拉（默认自由矩形）；第三十次修订改
+   "后改优先"——切换统一形状即全局重声明（逐图已设形状/框重置跟随统一）。 */
 (function () {
   'use strict';
 
@@ -439,9 +439,11 @@
     renderUploadList();
   }
 
-  // ---- 统一形状批级选择（2026-08-28 第二十九次修订；与统一尺寸同款自绘下拉） ----
+  // ---- 统一形状批级选择（第二十九次修订；第三十次修订改"后改优先"） ----
   // 未显式裁剪的图提交时以批级形状为默认声明（无框——后端 CropStep 对无框
-  // circle/heart/star 整图塑形、矩形类整图直通）；显式裁剪的图用自声明优先。
+  // 形状整图塑形、rectangle 整图直通）。后改优先（第三十次修订）：切换统一
+  // 形状 = 全局重声明——逐图已设的形状/裁剪框一并重置跟随统一；之后逐图
+  // 再裁剪则自声明优先到下一次统一切换（最后动作优先）。
   // 矩形类批级形状=直通零变化（回显不显标签不画预览，直通不撒谎）。
   var shapeDropdown = document.getElementById('batch-shape-dropdown');
   var shapeTrigger = document.getElementById('batch-shape-trigger');
@@ -474,7 +476,14 @@
         shapeDropdown.classList.remove('open');
         batchCropShape = opt.value;
         shapeTrigger.textContent = opt.label;
-        renderUploadList(); // 未裁剪图的形状标签/预览即时刷新
+        // 后改优先（第三十次修订）：统一切换=全局重声明——逐图已设的形状/框
+        // 一并重置为整图塑形（cropMeta=null 提交时回落批级默认），toast 明示
+        var resetCount = 0;
+        pendingImages.forEach(function (item) {
+          if (item.cropMeta) { item.cropMeta = null; resetCount++; }
+        });
+        if (resetCount > 0) showToast('已按「' + opt.label + '」重置 ' + resetCount + ' 张图的形状声明');
+        renderUploadList(); // 全部图的形状标签/预览即时刷新
       });
       shapeMenu.appendChild(optionElement);
     });
@@ -535,9 +544,12 @@
 
   function openCropModal(itemIndex) {
     cropTargetIndex = itemIndex;
-    // 形状重置为默认自由矩形（2026-08-26 需求：每次打开都从默认开始，
-    // 不停留上一次选择——避免客户对多张图连续裁剪时误用前一张的形状）
-    cropShapeSelect.value = 'rectangle';
+    // 预选当前生效形状（第三十次修订）：该图自声明优先，否则统一形状——
+    // 取代 2026-08-26"每次打开重置自由矩形"（旧口径防的是误用上一张的
+    // 弹层选择；预选当前生效值不属此列，且后改优先下统一形状即当前基准）
+    var item = pendingImages[itemIndex];
+    var effectiveShape = (item.cropMeta && item.cropMeta.shape) || batchCropShape;
+    cropShapeSelect.value = (SHAPE_ASPECT_RATIOS[effectiveShape] !== undefined) ? effectiveShape : 'rectangle';
     // 裁剪源固定用原图（已裁剪项重新裁剪时不受上次裁剪结果影响）
     var sourceUrl = pendingImages[itemIndex].originalPreviewUrl || pendingImages[itemIndex].previewUrl;
     cropModal.classList.add('active');
