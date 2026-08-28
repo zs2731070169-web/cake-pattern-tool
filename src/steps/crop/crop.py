@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 
+import cv2
 import numpy as np
 
 module_logger = logging.getLogger("pattern_tool.crop")
@@ -64,8 +65,13 @@ class CropStep:
             # 2026-08-28 修复"正方形/长方形设置不到图案上"）；rectangle/
             # free = 整图直通（默认值零行为变化）
             if shape_value != "rectangle" and shape_value != "free":
+                # 居中补方（第三十五次修订）：形状内接跟宽高比走（circle 直径
+                # =min 边）——同批不同宽高比的图形状大小不一（用户截图实锤
+                # "有的顶满有的很小"）。补方到 max 边后满幅内接：形状大小批
+                # 统一；pad 区全透明（内容零损失，不裁只补）
+                image_bgra = self._pad_to_square(image_bgra)
                 module_logger.info(
-                    "crop → done: shape=%s 无框整图塑形 %dx%d",
+                    "crop → done: shape=%s 无框补方塑形 %dx%d",
                     shape_value, image_bgra.shape[1], image_bgra.shape[0],
                 )
                 image_bgra = self._apply_shape_mask(image_bgra, shape_value)
@@ -111,6 +117,21 @@ class CropStep:
         if image_ndarray.ndim == 3 and image_ndarray.shape[2] == 3:
             return CropStepResult(result[:, :, :3], "done")
         return CropStepResult(result, "done")
+
+    @staticmethod
+    def _pad_to_square(image_bgra: np.ndarray) -> np.ndarray:
+        """居中补方（第三十五次修订）：短边方向 pad 全透明到 max(W,H)。
+        内容零损失（不裁只补，原图区像素与 alpha 不动）；已正方形直通。"""
+        height, width = image_bgra.shape[:2]
+        side = max(width, height)
+        if width == side and height == side:
+            return image_bgra
+        pad_x = (side - width) // 2
+        pad_y = (side - height) // 2
+        return cv2.copyMakeBorder(
+            image_bgra, pad_y, side - height - pad_y, pad_x, side - width - pad_x,
+            cv2.BORDER_CONSTANT, value=(0, 0, 0, 0),
+        )
 
     @staticmethod
     def _apply_shape_mask(image_bgra: np.ndarray, shape_value: str) -> np.ndarray:

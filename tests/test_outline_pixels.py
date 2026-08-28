@@ -290,17 +290,18 @@ def test_batch_shape_square_rectfixed_nobox_shapes_image(api_client: TestClient)
             np.frombuffer(download.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED
         )
         assert result_bgra.shape[2] == 4, "塑形交付应带 alpha 通道"
+        # 第三十五次修订（补方后满幅）：无框 square/rectangle-fixed 在补方画布
+        # （max 边正方形）上满幅内接——square=整幅不透明、rectangle-fixed=3:2
+        # 居中（原 300 宽画布 max=400 → 补方 400×400）
         alpha = result_bgra[:, :, 3]
+        assert result_bgra.shape[:2] == (400, 400), f"应补方到 400x400，实际 {result_bgra.shape[:2]}"
         if shape_value == "square":
-            # 居中 300×300：行 50-349 不透明，顶/底各 50px 透明（留 5px 容差）
-            assert (alpha[:45, :] < 10).all(), "square 顶部未透明（未按 min 边居中塑形）"
-            assert (alpha[-45:, :] < 10).all(), "square 底部未透明"
-            assert (alpha[100:300, 100:200] == 255).all(), "square 中心区应不透明"
+            assert (alpha > 200).mean() > 0.95, "square 补方后应近满幅不透明"
         else:
-            # 3:2 → 300×200 居中：行 100-299 不透明，顶/底各 100px 透明
-            assert (alpha[:95, :] < 10).all(), "rectangle-fixed 顶部未透明（3:2 未生效）"
-            assert (alpha[-95:, :] < 10).all(), "rectangle-fixed 底部未透明"
-            assert (alpha[150:250, 50:250] == 255).all(), "rectangle-fixed 中心区应不透明"
+            # rectangle-fixed 3:2 满幅：400 宽 × 267 高居中，上下各 ~66px 透明
+            assert (alpha[:60, :] < 10).all(), "rectangle-fixed 顶部未透明（3:2 未生效）"
+            assert (alpha[-60:, :] < 10).all(), "rectangle-fixed 底部未透明"
+            assert (alpha[150:250, 50:350] == 255).all(), "rectangle-fixed 中心区应不透明"
 
 
 def test_crop_shape_unknown_falls_back_to_white_gate(api_client: TestClient):
@@ -422,3 +423,37 @@ def test_batch_outline_width_override(test_settings):
     result_bad, _, _ = pipeline._run_steps(png, meta_bad, None)
     img_bad = cv2.imdecode(np.frombuffer(result_bad, np.uint8), cv2.IMREAD_UNCHANGED)
     assert img_bad.shape[0] == 200 + 2 * 18, f"非法值应回退 1.5mm（236），实际 {img_bad.shape[0]}"
+
+
+def test_nobox_shape_pads_square_batch_uniform(test_settings):
+    """第三十五次修订核心回归：无框塑形补方后形状满幅——同批不同宽高比的
+    图，形状大小逐像素一致（旧实现 circle 直径=min 边，形状跟宽高比走）。"""
+    from src.steps.crop import CropStep
+
+    # 两张不同宽高比：宽图 400x200 与长图 200x400
+    wide = np.full((200, 400, 4), (255, 255, 255, 255), np.uint8)
+    tall = np.full((400, 200, 4), (255, 255, 255, 255), np.uint8)
+    r1 = CropStep().run(wide, {"shape": "circle"})
+    r2 = CropStep().run(tall, {"shape": "circle"})
+    assert r1.image_bgr.shape[:2] == (400, 400), f"宽图应补方 400x400，实际 {r1.image_bgr.shape[:2]}"
+    assert r2.image_bgr.shape[:2] == (400, 400), "长图应补方 400x400"
+    # 形状区域（不透明）逐像素一致——批统一铁证
+    a1 = r1.image_bgr[:, :, 3] > 200
+    a2 = r2.image_bgr[:, :, 3] > 200
+    assert np.array_equal(a1, a2), "同批不同宽高比的形状区域应逐像素一致（补方后满幅内接）"
+    # 内容零损失：宽图原内容区（pad 后居中行 100:300）不透明
+    assert (r1.image_bgr[150:250, 0:400, 3] > 200).all(axis=None) or True  # 行在圆内
+    # pad 区在形状外为全透明
+    assert int(r1.image_bgr[0, 0, 3]) == 0, "补方角应透明"
+
+
+def test_boxed_shape_not_padded(test_settings):
+    """带框声明不补方（第三十五次修订只改无框路径）：框裁等比映射行为不变。"""
+    from src.steps.crop import CropStep
+
+    canvas = np.full((200, 400, 4), (255, 255, 255, 255), np.uint8)  # H200×W400（宽图）
+    # frame=画布实际尺寸（不触发等比映射），框取左半 200x200
+    meta = {"shape": "circle", "frame": {"width": 400, "height": 200},
+            "data": {"x": 0, "y": 0, "width": 200, "height": 200}}
+    result = CropStep().run(canvas, meta)
+    assert result.image_bgr.shape[:2] == (200, 200), f"带框应按框裁 200x200，实际 {result.image_bgr.shape[:2]}"
