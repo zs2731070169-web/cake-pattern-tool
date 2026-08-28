@@ -101,4 +101,4 @@ docs/plan/        # 技术方案文档（口径真源，改代码先改文档）
 ## 文档
 
 - [`docs/plan/修图工具最小技术方案.md`](docs/plan/修图工具最小技术方案.md) — 模块技术设计唯一真源（需求口径、ER 图、接口契约、修订记录）；**改代码先改文档**
-- [`docs/deploy/部署文档.md`](deploy/部署文档.md) — 生产部署（systemd 常驻 + Nginx 反代 + HTTPS 证书）
+- [`deploy/部署文档.md`](deploy/部署文档.md) — 生产部署（Docker Compose + Nginx 网关域名/HTTPS）

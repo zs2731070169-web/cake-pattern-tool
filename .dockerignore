@@ -1,0 +1,24 @@
+# Docker 构建上下文裁剪（与 .gitignore 口径对齐 + 构建防泄密）
+# 密钥绝不进镜像：.env 由 compose env_file 在运行时注入
+.env
+.env.*
+
+# 运行时数据（宿主卷挂载，不入镜像）
+data/
+
+# 本地开发与工具链
+.venv/
+.git/
+.idea/
+.claude/
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 非运行时目录（镜像只跑服务，不带测试/文档/脚本）
+tests/
+docs/
+scripts/
+deploy/
+*.md

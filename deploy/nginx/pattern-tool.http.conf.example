@@ -1,0 +1,20 @@
+# pattern-tool 网关（HTTP 联调版：无证书/未签发域名前的临时形态）
+# 用法（文档 4.2 节）：cp 本文件 到 nginx/conf.d/pattern-tool.conf，
+# 域名替换后 docker compose up -d；签发证书后换回生产版 conf。
+
+server {
+    listen 80;
+    server_name pattern.example.com;   # 联调可写 _ ，用 IP 直连
+
+    client_max_body_size 300m;
+    proxy_read_timeout  300s;
+    proxy_send_timeout  300s;
+
+    location / {
+        proxy_pass http://app:8200;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}

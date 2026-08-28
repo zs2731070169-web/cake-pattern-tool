@@ -1,0 +1,45 @@
+# pattern-tool 生产编排（用法见 deploy/部署文档.md）
+#
+# 拓扑：浏览器 --HTTPS 443--> nginx 网关 --内网 8200--> pt-web（uvicorn worker=1）
+# - pt-web 不映射宿主端口：唯一入口是 nginx（技术方案 7.1 反代口径）；
+# - 数据卷 app-data 持久化 SQLite/批次图/缓存/日志（TTL 每小时自动清理，
+#   重启恢复兜底崩溃），容器重建数据不丢；
+# - 证书从宿主机 /etc/letsencrypt 只读挂载（certbot standalone 签发，
+#   见文档第 4 节；尚未签证书的首次联调先换用 HTTP 版 conf）。
+
+name: pattern-tool
+
+services:
+  pt-web:                        # 技术方案 2 节对该单体的正式命名（nginx proxy_pass 同名寻址）
+    build:
+      context: ..                # 构建上下文 = 仓库根（.dockerignore 在仓库根）
+      dockerfile: deploy/Dockerfile
+    image: pattern-tool:latest
+    restart: unless-stopped
+    env_file: ../.env            # 仓库根 .env（与本地开发同源；真实环境变量优先级更高）
+    volumes:
+      - app-data:/app/data       # SQLite + 批次图 + 缓存 + 日志（24h TTL 清理）
+    expose:
+      - "8200"                   # 仅容器网络可达，不占宿主端口
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8200/api/meta', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro        # 网关配置（文档指导放置对应版本）
+      - /etc/letsencrypt:/etc/letsencrypt:ro       # 宿主机 certbot 证书（HTTP 版联调时此挂载可为空目录）
+    depends_on:
+      pt-web:
+        condition: service_healthy                 # pt-web 就绪前 nginx 不启，避免启动期 502
+
+volumes:
+  app-data:
