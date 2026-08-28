@@ -52,7 +52,8 @@
        外观与滑出动画。原生 select 弃用原因：选项样式/定位不可控。
        min-width 190→130：批级两下拉水平排列收窄（第二十九次修订同日），
        trigger 文案超宽自动撑开） */
-    .size-dropdown { min-width: 130px; position: relative; flex: 0 1 auto; }
+    .size-dropdown { width: 118px; position: relative; flex: 0 0 auto; }
+    /* 固定等宽（第三十四次修订样式统一）：三选择器逐像素同宽不随内容漂移 */
     .size-dropdown-trigger {
       width: 100%; text-align: left; background: #fff; border: 1px solid #e5e7eb;
       border-radius: 6px; padding: 4px 10px; font-size: 12px; color: #555;
@@ -62,7 +63,7 @@
     .size-dropdown.open .size-dropdown-trigger::after { transform: rotate(180deg); }
     .size-dropdown-menu {
       position: absolute; top: calc(100% + 6px); left: 0; z-index: 50;
-      width: 100%; /* 与触发按钮同宽（菜单宽度跟选择器，不再按内容自适应） */
+      width: max-content; min-width: 100%; /* 按最长选项自适应，下限=盒宽（浮层不推内容） */
       max-height: 0; overflow: hidden; transition: max-height .25s ease;
     }
     .size-dropdown.open .size-dropdown-menu { max-height: 420px; }
@@ -257,16 +258,16 @@
       <div class="batch-settings-row" id="batch-settings-row">
         <span class="batch-setting-label">统一形状：</span>
         <div class="size-dropdown" id="batch-shape-dropdown">
-          <button type="button" class="size-dropdown-trigger" id="batch-shape-trigger">自由矩形（默认）</button>
+          <button type="button" class="size-dropdown-trigger" id="batch-shape-trigger">自由矩形</button>
           <div class="size-dropdown-menu"><div class="size-dropdown-menu-inner" id="batch-shape-menu"></div></div>
         </div>
-        <span class="batch-setting-label" style="margin-left: 18px;">统一尺寸：</span>
+        <span class="batch-setting-label" style="margin-left: 12px;">统一尺寸：</span>
         <div class="size-dropdown" id="batch-size-dropdown">
           <button type="button" class="size-dropdown-trigger" id="batch-size-trigger">不设置</button>
           <div class="size-dropdown-menu"><div class="size-dropdown-menu-inner" id="batch-size-menu"></div></div>
         </div>
-        <span class="batch-setting-label" style="margin-left: 18px;">统一线宽：</span>
-        <div class="size-dropdown" id="batch-width-dropdown" style="min-width: 84px;">
+        <span class="batch-setting-label" style="margin-left: 12px;">统一描边：</span>
+        <div class="size-dropdown" id="batch-width-dropdown">
           <button type="button" class="size-dropdown-trigger" id="batch-width-trigger">默认</button>
           <div class="size-dropdown-menu"><div class="size-dropdown-menu-inner" id="batch-width-menu"></div></div>
         </div>

@@ -356,9 +356,12 @@
   var batchTrigger = document.getElementById('batch-size-trigger');
   var batchMenu = document.getElementById('batch-size-menu');
   var batchSizeCm = null; // 批级打印尺寸（cm；null=不设置原幅交付）
-  var BATCH_OPTIONS = [{ value: '', label: '不设置（原图大小）' }]
-    .concat(SIZE_OPTIONS.map(function (opt) { return { value: String(opt.cm), label: '全部: ' + opt.label }; }))
-    .concat([{ value: 'custom', label: '全部: 自定义 (cm)' }]);
+  // trigger 短文案（第三十四次修订样式统一），菜单项保留详细文案
+  var BATCH_OPTIONS = [{ value: '', label: '不设置', verbose: '不设置（原图大小）' }]
+    .concat(SIZE_OPTIONS.map(function (opt) {
+      return { value: String(opt.cm), label: opt.label, verbose: '全部: ' + opt.label };
+    }))
+    .concat([{ value: 'custom', label: '自定义 (cm)', verbose: '全部: 自定义 (cm)' }]);
   // "清除"选项已撤（2026-08-27 用户定案：与"不设置"语义重复）
 
   function setBatchTriggerLabel(label) {
@@ -373,7 +376,7 @@
     BATCH_OPTIONS.forEach(function (opt) {
       var optionElement = document.createElement('div');
       optionElement.className = 'menu-option' + (opt.value === '' ? ' selected' : '');
-      optionElement.textContent = opt.label;
+      optionElement.textContent = opt.verbose || opt.label;
       optionElement.dataset.value = opt.value;
       optionElement.addEventListener('click', function () {
         // 选中态迁移
@@ -404,7 +407,7 @@
   // 2026-08-27 用户定案"批量值只作用于本批"）
   function resetBatchSizeSelection() {
     batchSizeCm = null;
-    setBatchTriggerLabel('不设置（原图大小）');
+    setBatchTriggerLabel('不设置');
     Array.prototype.forEach.call(batchMenu.children, function (c) {
       c.classList.toggle('selected', c.dataset.value === '');
     });
@@ -413,7 +416,7 @@
   function applyBatchSize(value, label) {
     if (value === '') {
       batchSizeCm = null;
-      setBatchTriggerLabel('不设置（原图大小）');
+      setBatchTriggerLabel('不设置');
       renderUploadList();
       return;
     }
@@ -422,7 +425,7 @@
       var parsed = parseFloat(input);
       if (input != null && !isNaN(parsed) && parsed >= 5 && parsed <= 33) {
         batchSizeCm = parsed;
-        setBatchTriggerLabel('全部: ' + parsed + 'cm');
+        setBatchTriggerLabel(parsed + 'cm');
       } else {
         if (input != null) window.alert('请输入 5-33 之间的数字（33cm 为打印机最大幅面）');
         // 取消输入：批级值与选中态一并回"不设置"（不留隐藏残留值）
@@ -430,7 +433,7 @@
         Array.prototype.forEach.call(batchMenu.children, function (c) {
           c.classList.toggle('selected', c.dataset.value === '');
         });
-        setBatchTriggerLabel('不设置（原图大小）');
+        setBatchTriggerLabel('不设置');
         return;
       }
     } else {
@@ -502,7 +505,7 @@
   var shapeMenu = document.getElementById('batch-shape-menu');
   var batchCropShape = 'rectangle'; // 批级默认形状（rectangle=整图直通）
   var SHAPE_DROPDOWN_OPTIONS = [
-    { value: 'rectangle', label: '自由矩形（默认）' },
+    { value: 'rectangle', label: '自由矩形', verbose: '自由矩形（默认）' },
     { value: 'circle', label: '圆形' },
     { value: 'square', label: '正方形' },
     { value: 'rectangle-fixed', label: '长方形' },
@@ -520,7 +523,7 @@
     SHAPE_DROPDOWN_OPTIONS.forEach(function (opt) {
       var optionElement = document.createElement('div');
       optionElement.className = 'menu-option' + (opt.value === 'rectangle' ? ' selected' : '');
-      optionElement.textContent = opt.label;
+      optionElement.textContent = opt.verbose || opt.label;
       optionElement.dataset.value = opt.value;
       optionElement.addEventListener('click', function () {
         Array.prototype.forEach.call(shapeMenu.children, function (c) { c.classList.remove('selected'); });
@@ -556,7 +559,7 @@
   // 提交后复位（批级形状与尺寸同规则：只作用于本批，下一批回默认）
   function resetBatchShapeSelection() {
     batchCropShape = 'rectangle';
-    shapeTrigger.textContent = '自由矩形（默认）';
+    shapeTrigger.textContent = '自由矩形';
     Array.prototype.forEach.call(shapeMenu.children, function (c) {
       c.classList.toggle('selected', c.dataset.value === 'rectangle');
     });
