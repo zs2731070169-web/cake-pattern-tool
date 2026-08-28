@@ -974,17 +974,20 @@
   function startPolling() {
     stopPolling();
     pollTimerId = setInterval(pollJobStatus, POLL_INTERVAL_MS);
+    if (cancelJobButton) cancelJobButton.disabled = false; // 处理中可取消（第三十七次修订）
     pollJobStatus(); // 立即首查
   }
 
   function stopPolling() {
     if (pollTimerId) { clearInterval(pollTimerId); pollTimerId = null; }
+    if (cancelJobButton) cancelJobButton.disabled = true; // 轮询停=无在途任务可取消
   }
 
   async function pollJobStatus() {
     if (!submittingJobId) return;
     try {
       var response = await fetch('/api/jobs/' + submittingJobId);
+      if (!submittingJobId) return; // 已取消/已重置：丢弃在途迟到响应（第三十七次修订——防重绘覆盖引导态）
       if (response.status === 404) {
         stopPolling();
         stopElapsedTicker(); // 计时随批次终止（2026-08-28）
@@ -1033,6 +1036,7 @@
 
   var batchDownloadButton = document.getElementById('batch-download-button');
   var batchDeleteButton = document.getElementById('batch-delete-button');
+  var cancelJobButton = document.getElementById('cancel-job-button');
   var batchStatus = document.getElementById('batch-status');
   var batchResultUrls = []; // 当前批次的 completed 结果 URL 序列（批量动作用）
 
@@ -1296,13 +1300,29 @@
     return card;
   }
 
-  restartButton.addEventListener('click', function () {
+  // 放弃当前任务回引导态（第三十七次修订：取消任务与再处理一批共用——
+  // 停轮询/停计时/清提交号/右栏回引导态/收放大浮层）
+  function abandonCurrentJob() {
     stopPolling();
     stopElapsedTicker(); // 计时随会话重置（2026-08-28）
     submittingJobId = null;
     showResultPlaceholder(); // 双栏常驻：回引导态而非隐藏
     hideResultZoom();
-  });
+  }
+
+  restartButton.addEventListener('click', abandonCurrentJob);
+
+  // 取消任务（第三十七次修订）：处理中放弃等待——会话级口径（同"全部删除"
+  // 不调后端），后台批次继续跑完由 24h TTL 清理；confirm 防误点（本批结果
+  // 视图取消后不可恢复）
+  if (cancelJobButton) {
+    cancelJobButton.addEventListener('click', function () {
+      if (!submittingJobId || !pollTimerId) return; // 仅处理中可用（可用态随轮询起停）
+      if (!window.confirm('取消后本批结果将不再显示，确定取消？')) return;
+      abandonCurrentJob();
+      showToast('已取消，可重新上传处理');
+    });
+  }
 
   // ---- 结果图悬停放大（桌面 hover 查看细节；触屏无 hover 不触发，pointer-events:none 不打断点击/长按） ----
 

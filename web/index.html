@@ -288,10 +288,12 @@
       <div class="panel-head">
         <h2>2. 处理结果</h2>
         <!-- 页面级动作（2026-08-27 用户定案：标题行右侧"下载/删除"两钮——
-             下载=当前结果打包 ZIP，删除=删除勾选；有结果才可用） -->
+             下载=当前结果打包 ZIP，删除=删除勾选；有结果才可用；
+             第三十七次修订追加"取消任务"——仅处理中可用，放弃等待回引导态） -->
         <div class="head-actions" id="result-head-actions">
           <button id="batch-download-button" disabled>批量下载</button>
           <button id="batch-delete-button" class="danger-ghost" disabled>批量删除</button>
+          <button id="cancel-job-button" class="ghost" disabled>取消任务</button>
         </div>
       </div>
       <!-- 过程反馈条（打包进度等瞬时提示；常驻引导文案已撤） -->
