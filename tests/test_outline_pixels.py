@@ -181,9 +181,9 @@ def test_outline_matting_mask_light_pattern_kept(test_settings):
     assert matting_mask_area > 0, "alpha 蒙版法应保留浅色图案"
 
 
-def test_crop_shape_gray_background_outer_ring(api_client: TestClient):
-    """第三十二次修订：外边缘描边无条件执行——灰底照片裁圆同样出外环线
-    （线环在形状外侧透明区上，永不接触内容；白底判定门随内缩画法退役）。"""
+def test_crop_shape_gray_background_skipped(api_client: TestClient):
+    """口径（第三十三次修订：白底判定恢复）：灰底照片裁圆不描边——非白底
+    边界本来就看得见，外环画法只改"怎么画"不改"画不画"。"""
     gray_canvas = np.full((400, 400, 3), 215, dtype=np.uint8)  # 灰底
     success, buffer = cv2.imencode(".png", gray_canvas)
     assert success
@@ -194,7 +194,7 @@ def test_crop_shape_gray_background_outer_ring(api_client: TestClient):
     )
     assert response.status_code == 200
     job_status = wait_until_job_completed(api_client, response.json()["job_id"])
-    assert job_status["images"][0]["stage_results"]["outline"] == "done"
+    assert job_status["images"][0]["stage_results"]["outline"] == "skipped"
 
 
 def test_crop_shape_white_background_outlines_shape(api_client: TestClient):
@@ -303,17 +303,13 @@ def test_batch_shape_square_rectfixed_nobox_shapes_image(api_client: TestClient)
             assert (alpha[150:250, 50:250] == 255).all(), "rectangle-fixed 中心区应不透明"
 
 
-def test_crop_shape_unknown_falls_back_to_rectangle_outer_ring(api_client: TestClient):
-    """畸形/未知形状声明按 rectangle 处理（第三十二次修订）：无条件外环整圈。"""
+def test_crop_shape_unknown_falls_back_to_white_gate(api_client: TestClient):
+    """畸形/未知形状声明按 rectangle 处理，仍过白底判定：灰底图 → skipped。"""
     from src.steps.outline import OutlineStep
 
     gray_canvas = np.full((300, 300, 3), 215, dtype=np.uint8)
     result = OutlineStep(_stub_settings()).run(gray_canvas, crop_shape="weird-shape")
-    assert result.stage_value == "done"
-    # 3 通道直调 → 白底合成回显，外环整圈可见（300+36=336）
-    assert result.image_bgr.shape[0] == 336
-    row = result.image_bgr[168, 0:16, 0].astype(int)
-    assert any(abs(int(v) - _stub_settings().outline_gray_level) <= 10 for v in row), "外环灰线缺失"
+    assert result.stage_value == "skipped"
 
 
 def _stub_settings():

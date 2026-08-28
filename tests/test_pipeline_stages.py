@@ -42,14 +42,14 @@ def test_clean_image_all_steps_or_outline(api_client: TestClient):
     assert stages["outline"] == "done"
 
 
-def test_non_white_background_outline_outer_ring(api_client: TestClient):
-    """验收 3（第三十二次修订口径）：非白底图同样无条件外环描边——线环在
-    形状外侧透明区上，永不接触内容，白底判定门退役。"""
+def test_non_white_background_outline_skipped(api_client: TestClient):
+    """验收 3（第三十三次修订：白底判定恢复——非白底图边界本来就看得见，
+    外环是噪音，不加线；外环画法只改"怎么画"不改"画不画"）。"""
     dark_bytes = build_pattern_png_bytes(background_bgr=(210, 210, 205))
     job_id = submit_single_image(api_client, dark_bytes)
     job_status = wait_until_job_completed(api_client, job_id)
     stages = job_status["images"][0]["stage_results"]
-    assert stages["outline"] == "done"
+    assert stages["outline"] == "skipped"
 
 
 def test_dense_pattern_fill_skipped(api_client: TestClient):

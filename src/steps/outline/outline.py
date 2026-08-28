@@ -437,11 +437,15 @@ class OutlineStep:
         module_logger.info(
             "outline start: shape=%s size=%dx%d", shape_value, image_bgra.shape[1], image_bgra.shape[0]
         )
+        # 第三十三次修订：白底判定恢复（撤销三十二次的"无条件执行"）——判定门
+        # 的职责从来不是保护内容（外环画法线永不接触内容），而是"非白底图的
+        # 边界本来就看得见，外环是噪音"：灰底/照片背景不加线。线带净空判定
+        # （line_band_is_clear）维持退役——它管的"内容压线"在外环画法下不存在。
+        white_verdict = shape_inner_band_is_white(image_bgra, shape_value, self._settings)
+        if not white_verdict:
+            module_logger.info("outline → skipped (形状边带非白底)")
+            return OutlineStepResult(image_ndarray, "skipped")
         # 第三十二次修订：外边缘描边（线环在形状外侧透明区上，永不接触内容）
-        # ——白底判定（shape_inner_band_is_white）与线带净空判定
-        # （line_band_is_clear）随内缩画法退役：它们存在的前提"线会压内容"
-        # 在外环画法下不成立，且浅色图案（luma≥230 的冰蓝渐变）实测两闸
-        # 都拦不住误画/误跳。函数保留作历史存档，不再被管线调用。
         outlined = draw_shape_outline(image_ndarray, shape_value, self._settings)
         module_logger.info(
             "outline → done(外环): 线宽=%dpx 灰度=%d",
