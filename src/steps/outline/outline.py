@@ -35,6 +35,11 @@ class OutlineStepResult:
 WHITE_BG_MIN_MEDIAN_LUMA = 235  # 背景整体够亮：边缘亮度中位数下限
 WHITE_BG_UNIFORM_LUMA = 230  # 均匀性：亮度低于此值的边缘像素视为杂色/暗物
 WHITE_BG_UNIFORM_RATIO = 0.9  # ≥ 90% 边缘像素达均匀亮度才算白底
+# 线带净空判定（2026-08-28 第三十一次修订）：裁切参考线绝不可被内容压线
+# （用户真图实锤：摩羯插画羊角/鱼尾越过灰线顶到画布边——沿线剪直接剪掉
+# 图案）。线将落笔的环带必须几乎全白 + 几乎全不透明（断带同样不画）。
+LINE_BAND_MIN_COVERAGE = 0.95  # 线带内可落笔（不透明）占比下限——低于则线是断的
+LINE_BAND_WHITE_RATIO = 0.995  # 线带内"视觉白"（luma≥230）占比下限——容忍 JPEG 噪点级杂散，内容级越线必拒
 PATTERN_LUMA_MARGIN = 12  # 图案判定：比背景亮度低此值以上才算图案（容忍软阴影）
 PATTERN_LUMA_CLIP = (220, 245)  # 图案亮度阈值的裁剪区间（上限=数码纯白语义不放宽）
 MIN_PATTERN_AREA_RATIO = 0.05  # 连通块面积达主图案 5% 以上才描（碎屑过滤）
@@ -313,6 +318,90 @@ def crop_shape_region_mask(shape_value: str, width: int, height: int) -> np.ndar
     return canvas > 0
 
 
+def _shape_line_band_geometry(
+    image_bgra: np.ndarray, shape_value: str, settings: PatternToolSettings
+) -> tuple[np.ndarray | None, np.ndarray]:
+    """线带几何（画线与净空判定共用，防两处漂移）：返回 (线带几何 bool, usable)。
+
+    矩形类（含 square/rectangle-fixed 居中内接掩膜）：按掩膜有效区定框，
+    四条边带内缩一个线宽（端点同幅内缩防四角 L 形凸块）；其余形状：
+    形状区域 − 内缩(线宽+羽化补偿)（第二十五次修订口径）。空掩膜返回 None。
+    """
+    image_height, image_width = image_bgra.shape[:2]
+    shape_mask = crop_shape_region_mask(shape_value, image_width, image_height)
+    line_thickness = outline_width_pixels(settings)
+    hard_opaque = image_bgra[:, :, 3] == 255
+    usable = hard_opaque if hard_opaque.mean() > 0.5 else opaque_mask(image_bgra)
+
+    if shape_value in RECTANGLE_LIKE_SHAPES:
+        active_rows = np.nonzero(shape_mask.any(axis=1))[0]
+        active_cols = np.nonzero(shape_mask.any(axis=0))[0]
+        if len(active_rows) == 0 or len(active_cols) == 0:  # 防御：空掩膜
+            return None, usable
+        top_edge = int(active_rows.min())
+        bottom_edge = int(active_rows.max()) + 1
+        left_edge = int(active_cols.min())
+        right_edge = int(active_cols.max()) + 1
+        frame_band = np.zeros((image_height, image_width), dtype=bool)
+        inset = line_thickness
+        span_rows = (top_edge + inset, bottom_edge - inset)  # 边带行/列的起止（含）
+        span_cols = (left_edge + inset, right_edge - inset)
+        frame_band[top_edge + inset : top_edge + inset + line_thickness, span_cols[0]:span_cols[1]] = True  # 顶
+        frame_band[bottom_edge - inset - line_thickness : bottom_edge - inset, span_cols[0]:span_cols[1]] = True  # 底
+        frame_band[span_rows[0]:span_rows[1], left_edge + inset : left_edge + inset + line_thickness] = True  # 左
+        frame_band[span_rows[0]:span_rows[1], right_edge - inset - line_thickness : right_edge - inset] = True  # 右
+        return frame_band, usable
+
+    # 内缩量 = 线宽 + 羽化补偿（第二十五次修订）
+    band_depth = line_thickness + SHAPE_EDGE_FEATHER_COMPENSATION_PX
+    shrink_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * band_depth + 1, 2 * band_depth + 1),
+    )
+    inner_mask = _erode_zero_border(shape_mask.astype(np.uint8), shrink_kernel) > 0
+    return (shape_mask & ~inner_mask), usable
+
+
+def line_band_is_clear(
+    image_bgra: np.ndarray, shape_value: str, settings: PatternToolSettings
+) -> tuple[bool, str]:
+    """线带净空判定（第三十一次修订）：线将落笔的环带必须可裁——不透明
+    （≥95%，否则线断）且几乎全白（≥99.5% luma≥230，容忍噪点级杂散）。
+
+    旧白底判定测的是"剔除图案后的背景白度"（2026-08-24 口径，防满幅图案
+    误杀）——内容越线（羊角/鱼尾压线带）反而被剔出统计放行画线，线压内容
+    沿线剪即伤图。本判定独立于背景语义，只看线带本身：**线所在处必须是可以
+    剪掉的空白**。返回 (是否净空, 拒绝原因)。
+    """
+    geometry, usable = _shape_line_band_geometry(image_bgra, shape_value, settings)
+    if geometry is None:
+        return False, "空形状掩膜"
+    # 预期可画区 = 线带剥掉羽化圈（形状边界内 ~2px 是 crop 羽化 alpha<255 的
+    # 过渡带，画线本就排除它——分母含它会恒定低估覆盖率，矩形边框带
+    # inset≥线宽天然在羽化圈外不受影响）
+    image_height, image_width = image_bgra.shape[:2]
+    shape_mask = crop_shape_region_mask(shape_value, image_width, image_height)
+    feather_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * SHAPE_EDGE_FEATHER_COMPENSATION_PX + 1, 2 * SHAPE_EDGE_FEATHER_COMPENSATION_PX + 1),
+    )
+    core_mask = _erode_zero_border(shape_mask.astype(np.uint8), feather_kernel) > 0
+    expected = geometry & core_mask
+    expected_total = int(np.count_nonzero(expected))
+    if expected_total == 0:
+        return False, "线带为空（图幅小于线宽）"
+    paintable = geometry & usable
+    coverage = float(np.count_nonzero(paintable)) / expected_total
+    if coverage < LINE_BAND_MIN_COVERAGE:
+        return False, f"线带不透明占比 {coverage:.0%}（透明边距致断线）"
+    band_pixels = image_bgra[paintable][:, :3]
+    band_gray = cv2.cvtColor(band_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2GRAY).ravel()
+    white_ratio = float(np.mean(band_gray >= WHITE_BG_UNIFORM_LUMA))
+    if white_ratio < LINE_BAND_WHITE_RATIO:
+        return False, f"线带内容占比 {1 - white_ratio:.1%}（裁切线不可压内容）"
+    return True, ""
+
+
 def draw_shape_outline(
     image_ndarray: np.ndarray, shape_value: str, settings: PatternToolSettings
 ) -> np.ndarray:
@@ -326,9 +415,6 @@ def draw_shape_outline(
     image_bgra = ensure_bgra(image_ndarray)
     image_height, image_width = image_bgra.shape[:2]
     shape_mask = crop_shape_region_mask(shape_value, image_width, image_height)
-    line_thickness = outline_width_pixels(settings)
-    hard_opaque = image_bgra[:, :, 3] == 255
-    usable = hard_opaque if hard_opaque.mean() > 0.5 else opaque_mask(image_bgra)
 
     # 形状外颜色清洗（2026-08-28 第二十一次修订）：放大链（佐糖定倍+LANCZOS
     # 尾程）会把图案颜色边缘外渗越过解析形状边界数 px——线沿解析边界画却
@@ -346,41 +432,11 @@ def draw_shape_outline(
                 "outline: 形状外颜色清洗 %d px（放大链渗出伪影）", int(bleed.sum())
             )
 
-    if shape_value in RECTANGLE_LIKE_SHAPES:
-        # 矩形类（含 square/rectangle-fixed，第二十九次修订）：形状区域是轴对齐
-        # 矩形（rectangle/free=全图，square/rectangle-fixed=居中内接），"区域−
-        # 内缩"通式对矩形掩膜产出的带贴最外缘（行/列 0 起笔）——丢失旧口径
-        # "内缩一个线宽防打印裁边"。统一走边框带构造：按掩膜有效区定框，四条
-        # 边带内缩一个线宽。端点同幅内缩：边带的行/列区间也从 inset 起止——
-        # 整行整列写会在四角多出 L 形凸块（竖线顶段/横线端头超出边框拐角）。
-        active_rows = np.nonzero(shape_mask.any(axis=1))[0]
-        active_cols = np.nonzero(shape_mask.any(axis=0))[0]
-        if len(active_rows) == 0 or len(active_cols) == 0:  # 防御：空掩膜不画线
-            return image_ndarray
-        top_edge = int(active_rows.min())
-        bottom_edge = int(active_rows.max()) + 1
-        left_edge = int(active_cols.min())
-        right_edge = int(active_cols.max()) + 1
-        frame_band = np.zeros((image_height, image_width), dtype=bool)
-        inset = line_thickness
-        span_rows = (top_edge + inset, bottom_edge - inset)  # 边带行/列的起止（含）
-        span_cols = (left_edge + inset, right_edge - inset)
-        frame_band[top_edge + inset : top_edge + inset + line_thickness, span_cols[0]:span_cols[1]] = True  # 顶
-        frame_band[bottom_edge - inset - line_thickness : bottom_edge - inset, span_cols[0]:span_cols[1]] = True  # 底
-        frame_band[span_rows[0]:span_rows[1], left_edge + inset : left_edge + inset + line_thickness] = True  # 左
-        frame_band[span_rows[0]:span_rows[1], right_edge - inset - line_thickness : right_edge - inset] = True  # 右
-        line_band = frame_band & usable
-    else:
-        # 内缩量 = 线宽 + 羽化补偿（第二十五次修订）：resize 形状 alpha 的
-        # sigma 0.8 羽化带（边界内 ~2px 半透明）会把线带最外像素排除在
-        # alpha==255 硬区外——内缩起画位置让整条线宽画足（见常量注释）
-        band_depth = line_thickness + SHAPE_EDGE_FEATHER_COMPENSATION_PX
-        shrink_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (2 * band_depth + 1, 2 * band_depth + 1),
-        )
-        inner_mask = _erode_zero_border(shape_mask.astype(np.uint8), shrink_kernel) > 0
-        line_band = shape_mask & ~inner_mask & usable
+    # 线带几何与净空判定共用一套计算（第三十一次修订抽公共函数防漂移）
+    geometry, usable = _shape_line_band_geometry(image_bgra, shape_value, settings)
+    if geometry is None:  # 防御：空掩膜不画线
+        return image_ndarray
+    line_band = geometry & usable
 
     gray_value = settings.outline_gray_level
     outlined_image = image_bgra.copy()
@@ -468,6 +524,13 @@ class OutlineStep:
         white_verdict = shape_inner_band_is_white(image_bgra, shape_value, self._settings)
         if not white_verdict:
             module_logger.info("outline → skipped (形状边带非白底)")
+            return OutlineStepResult(image_ndarray, "skipped")
+        # 线带净空（第三十一次修订）：裁切线绝不可被内容压线/断带——旧白底
+        # 判定"剔除图案后测背景"会让局部越线的内容（羊角/鱼尾压线带）逃过
+        # 检查，画出的线沿线剪直接伤图；本判定只看线带本身
+        clear, block_reason = line_band_is_clear(image_bgra, shape_value, self._settings)
+        if not clear:
+            module_logger.info("outline → skipped (线带非净空：%s)", block_reason)
             return OutlineStepResult(image_ndarray, "skipped")
         outlined = draw_shape_outline(image_ndarray, shape_value, self._settings)
         module_logger.info(

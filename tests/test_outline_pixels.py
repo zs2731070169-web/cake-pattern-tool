@@ -347,3 +347,29 @@ def test_shape_outline_cleans_bleed_outside_shape(tmp_path):
     # 边界外侧 1-5px（原渗出区）：渗出色必须被洗白（alpha 已透明，颜色值本身干净）
     outside_pixels = outlined[row, c+1:c+6, :3]
     assert (outside_pixels >= 248).all(), f"边界外渗出色未清洗: {outside_pixels[:, 0].tolist()}"
+
+
+def test_line_band_not_clear_skips_outline(test_settings):
+    """线带净空判定（第三十一次修订）：内容越线（大圆触边，压住线带）时
+    不画线——沿线剪会剪掉图案，裁切参考线语义失效。直接调 OutlineStep。"""
+    from src.steps.outline import OutlineStep
+
+    # 白底 + 居中大圆：半径 192（画布 400，边距 8px < 线宽内缩 14px 起）——
+    # 圆边压进矩形线带（inset 14..28px 行列带）→ 旧白底判定通过（剔图案后
+    # 背景白）、新净空判定必须拒绝
+    canvas = np.full((400, 400, 3), 255, dtype=np.uint8)
+    cv2.circle(canvas, (200, 200), 192, (60, 140, 60), -1)
+    bgra = cv2.cvtColor(canvas, cv2.COLOR_BGR2BGRA)
+    result = OutlineStep(test_settings).run(bgra, "square")
+    assert result.stage_value == "skipped", "内容压线带必须 skipped（裁切线不可越内容）"
+
+
+def test_line_band_clear_small_pattern_draws(test_settings):
+    """对照组：内容离边 ≥40px（线带净空）时正常画线——净空判定不误杀。"""
+    from src.steps.outline import OutlineStep
+
+    canvas = np.full((400, 400, 3), 255, dtype=np.uint8)
+    cv2.circle(canvas, (200, 200), 150, (60, 140, 60), -1)
+    bgra = cv2.cvtColor(canvas, cv2.COLOR_BGR2BGRA)
+    result = OutlineStep(test_settings).run(bgra, "square")
+    assert result.stage_value == "done", "线带净空（内容不压线）应正常画线"
