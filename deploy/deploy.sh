@@ -25,6 +25,16 @@ say()  { printf '\033[1;32m[deploy]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# ---- docker 权限自适应（2026-08-28 服务器实测：ubuntu 不在 docker 组，
+# 裸 docker 报 permission denied → 脚本退化为用户手动 sudo compose 起栈，
+# 跳过 HTTP 引导直接撞证书崩溃。统一 SUDO 前缀修复）----
+SUDO=""
+if ! docker info >/dev/null 2>&1; then
+  SUDO="sudo"
+  $SUDO docker info >/dev/null 2>&1 || die "docker 不可用（sudo 也不行）——检查 docker 服务与用户组"
+fi
+dk() { $SUDO docker "$@"; }
+
 cd "$SCRIPT_DIR"   # 所有 docker compose 命令在此目录执行（compose 自动读 ./docker-compose.yml）
 
 # ---- 前置检查 ----
@@ -71,20 +81,40 @@ retarget_conf_domain() {  # $1 = 新域名：把 conf 里 4 处域名（含证�
   say "conf 域名已替换：${current:-$placeholder} → $1"
 }
 
-certs_exist() { [[ -n "${DOMAIN:-}" && -d "/etc/letsencrypt/live/$DOMAIN" ]]; }
+certs_exist() { [[ -n "${DOMAIN:-}" && -n "$(cert_dir_for "$DOMAIN")" ]]; }
+
+cert_dir_for() {  # $1=域名 → 探测 SAN 覆盖该域名的 live 目录名（无则空）
+  # 陷阱记档（v19.2 FAQ）：live 目录名 = 签发时第一个 -d 域名，未必等于
+  # 目标域名（如 -d 裸域在前、证书含 www）。按证书实际 SAN 探测而非路径猜
+  local dir dom
+  dom="${1//./\\.}"
+  for dir in $($SUDO ls /etc/letsencrypt/live 2>/dev/null | grep -v '^README$'); do
+    $SUDO openssl x509 -in "/etc/letsencrypt/live/$dir/fullchain.pem" -noout -ext subjectAltName 2>/dev/null \
+      | grep -qE "DNS:$dom(,|$)" && { echo "$dir"; return 0; }
+  done
+  return 0
+}
+
+align_conf_cert_path() {  # $1=域名：把 conf 证书路径对准真实 live 目录
+  local live_dir
+  live_dir="$(cert_dir_for "$1")"
+  [[ -n "$live_dir" ]] || return 0
+  sed -i "s|/etc/letsencrypt/live/[^/]*/|/etc/letsencrypt/live/$live_dir/|g" "$CONF"
+  say "conf 证书路径已对准实际目录：live/$live_dir/"
+}
 
 # ---- 健康与冒烟 ----
 
 wait_healthy() {  # 等 pt-web healthcheck 转 healthy（build 后模型预热最长 ~60s）
   local cid deadline
-  cid="$(docker compose ps -q pt-web)"
+  cid="$(dk compose ps -q pt-web)"
   [[ -n "$cid" ]] || die "pt-web 容器未创建"
   deadline=$((SECONDS + 120))
   while :; do
-    if [[ "$(docker inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || true)" == "healthy" ]]; then
+    if [[ "$(dk inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || true)" == "healthy" ]]; then
       say "pt-web healthy"; return 0
     fi
-    (( SECONDS < deadline )) || die "pt-web 120s 内未 healthy —— docker compose logs pt-web 排障"
+    (( SECONDS < deadline )) || die "pt-web 120s 内未 healthy —— dk compose logs pt-web 排障"
     sleep 3
   done
 }
@@ -115,31 +145,33 @@ deploy() {
   TARGET="${TARGET:-127.0.0.1}"
 
   if certs_exist; then
-    say "模式：HTTPS（证书已存在于 /etc/letsencrypt/live/$DOMAIN）"
+    say "模式：HTTPS（探测到覆盖 $DOMAIN 的证书：live/$(cert_dir_for "$DOMAIN")）"
     [[ -f "$CONF" ]] || die "缺 $CONF —— git checkout 恢复后重跑"
     retarget_conf_domain "$DOMAIN"
-    docker compose up -d --build
+    align_conf_cert_path "$DOMAIN"
+    dk compose up -d --build
     wait_healthy
     smoke https && say "冒烟通过：https://$DOMAIN/api/meta"
   elif [[ -n "$DOMAIN" && -n "${EMAIL:-}" ]]; then
     say "模式：HTTP 起栈 → certbot 签发 → 切 HTTPS（域名 $DOMAIN）"
     write_http_conf "$DOMAIN"
-    docker compose up -d --build
+    dk compose up -d --build
     wait_healthy
     smoke http || true
     say "停网关释放 80 端口，certbot standalone 签发…"
-    docker compose stop nginx
-    docker run --rm -p 80:80 certbot/certbot certonly --standalone \
+    dk compose stop nginx
+    dk run --rm -p 80:80 certbot/certbot certonly --standalone \
       -d "$DOMAIN" --agree-tos -m "$EMAIL" --non-interactive
     restore_prod_conf
     retarget_conf_domain "$DOMAIN"
-    docker compose up -d nginx
+    align_conf_cert_path "$DOMAIN"   # 新签目录名=本命令的 -d（$DOMAIN 在前）——保险对准
+    dk compose up -d nginx
     smoke https && say "冒烟通过：https://$DOMAIN/api/meta"
   else
     [[ -n "$DOMAIN" ]] && warn "未提供 --email 且无证书 → HTTP 联调形态（$DOMAIN）"
     say "模式：HTTP 联调（$TARGET）"
     write_http_conf "$TARGET"
-    docker compose up -d --build
+    dk compose up -d --build
     wait_healthy
     smoke http && say "冒烟通过：http://$TARGET/api/meta"
     if [[ -n "$DOMAIN" ]]; then
@@ -148,7 +180,7 @@ deploy() {
   fi
 
   echo
-  say "服务状态："; docker compose ps
+  say "服务状态："; dk compose ps
   echo
   say "日常：./deploy.sh status | upgrade | renew-cert；完整手册见 deploy/部署文档.md"
 }
@@ -156,8 +188,8 @@ deploy() {
 upgrade() {
   preflight
   say "滚动重建 pt-web（nginx 不动，数据卷保留）…"
-  docker compose build pt-web
-  docker compose up -d pt-web
+  dk compose build pt-web
+  dk compose up -d pt-web
   wait_healthy
   if certs_exist; then smoke https && say "升级完成，冒烟通过（https）"
   else smoke http && say "升级完成，冒烟通过（http）"; fi
@@ -166,14 +198,14 @@ upgrade() {
 renew_cert() {
   preflight
   say "停网关 → certbot 续期 → 起网关（约 10 秒窗口）…"
-  docker compose stop nginx
-  docker run --rm -p 80:80 certbot/certbot renew
-  docker compose start nginx
+  dk compose stop nginx
+  dk run --rm -p 80:80 certbot/certbot renew
+  dk compose start nginx
   if certs_exist; then smoke https && say "续期完成，冒烟通过"; fi
 }
 
 status() {
-  docker compose ps
+  dk compose ps
   if certs_exist; then
     smoke https && say "冒烟：https OK" || warn "冒烟失败（https）"
   else
