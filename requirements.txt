@@ -8,8 +8,10 @@ pydantic-settings==2.15.0
 numpy==2.5.2
 opencv-python-headless==4.14.0.94
 pillow==12.3.0
-# 描边图案分割（u2netp 模型 4.5MB 首次运行自动下载入 ~/.rembg；离线部署需预下载）
+# 描边图案分割（u2netp 模型 4.5MB 首次运行自动下载入 ~/.rembg；Docker 构建时预下载）
+# [cpu] extra 显式装 onnxruntime——裸 rembg 不带 runtime（2026-08-28 Docker 首装实测：
+# 报 "No onnxruntime backend found"；此前本地能跑靠 rapidocr 时代残留的 onnxruntime）
 # 传递依赖 pooch/PyMatting/scikit-image/scipy/tqdm 由 pip 解析安装
-rembg==2.0.81
+rembg[cpu]==2.0.81
 httpx==0.28.1
 pytest==9.1.1
