@@ -938,7 +938,10 @@
       resetBatchShapeSelection();
       resetBatchWidthSelection();
       // 双栏同屏（2026-08-27 第六次修订）：右栏常驻无需显隐切换与滚动跟随
-      resultList.innerHTML = '<div class="status-text processing">处理中，请稍候…</div>';
+      // 居中口径同 showResultPlaceholder（2026-08-29：提示恒在卡片正中）
+      resultList.style.display = 'grid';
+      resultList.style.placeItems = 'center';
+      resultList.innerHTML = '<div class="status-text processing" style="padding:12px;">处理中，请稍候…</div>';
       serverClockOffsetMs = 0; // 钟差待首轮轮询 server_time 校正
       startPolling();
     } catch (submitError) {
@@ -1021,6 +1024,10 @@
 
   function renderResults(jobStatus) {
     latestJobStatus = jobStatus;
+    // 还原占位态的居中布局（showResultPlaceholder 设的 grid/center——
+    // 结果卡要用回 .image-list 网格布局）
+    resultList.style.display = '';
+    resultList.style.placeItems = '';
     resultList.innerHTML = '';
     batchResultUrls = [];
     jobStatus.images.forEach(function (imageStatus) {
@@ -1377,8 +1384,12 @@
   }
 
   // 右栏常驻初始态（2026-08-27 双栏：未提交时引导文案占位，不再隐藏面板）
+  // 2026-08-29：容器改 grid 水平垂直双向居中——占位文案始终在卡片正中
+  // （旧版 padding-top 挤压式"伪居中"，面板高度变化时文案偏上）
   function showResultPlaceholder() {
-    resultList.innerHTML = '<div class="status-text" style="padding:32px 12px;text-align:center;color:#b0b0b0;">'
+    resultList.style.display = 'grid';
+    resultList.style.placeItems = 'center';
+    resultList.innerHTML = '<div class="status-text" style="padding:12px;text-align:center;color:#b0b0b0;">'
       + '处理结果将显示在这里<br>左侧选择图片 → 点击「开始处理」</div>';
   }
   showResultPlaceholder();
