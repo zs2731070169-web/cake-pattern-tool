@@ -37,14 +37,17 @@ def test_outline_default_rectangle_when_uncropped(api_client: TestClient):
 
     download = api_client.get(image_status["result_url"])
     result_bgr = cv2.imdecode(np.frombuffer(download.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
-    # 不裁形：无透明区（原默认圆形四角透明已撤销）
+    # 外环四角圆角缺口（椭圆核等宽膨胀的正确偏移曲线，半径=线宽）：缺口
+    # alpha=0，主体不透明（第三十二次修订语义）
     if result_bgr.ndim == 3 and result_bgr.shape[2] == 4:
-        assert result_bgr[:, :, 3].min() == 255, "默认矩形不应有透明区"
+        assert int(result_bgr[0, 0, 3]) == 0, "外环圆角缺口应透明"
+        assert int(result_bgr[300, 300, 3]) == 255, "主体应不透明"
     gray_line = np.all(np.abs(result_bgr[:, :, :3].astype(int) - 190) <= 10, axis=2)
-    # 整图边框（线宽 1.5mm ≈ 18px @300DPI，内缩一个线宽起笔：行 18–36）
-    assert gray_line[18:36, 300].any(), "顶边框无灰线"
-    assert gray_line[564:582, 300].any(), "底边框无灰线"
-    assert not gray_line[200, 200], "画布中央出现灰线（非边框描边）"
+    # 外边缘描边（第三十二次修订）：画布外扩 18px 承接环带（600→636），
+    # 环带在最外圈行 0–17 / 618–635，中央无灰线
+    assert gray_line[0:18, 300].any(), "顶环带无灰线"
+    assert gray_line[618:636, 300].any(), "底环带无灰线"
+    assert not gray_line[300, 300], "画布中央出现灰线（非外环描边）"
 
 
 def legacy_test_outline_follows_actual_contour(api_client: TestClient):
@@ -135,12 +138,12 @@ def test_outline_never_covers_pattern_pixels(test_settings):
     result = step.run(canvas)
     assert result.stage_value == "done"
 
-    # 图案本体（原方块区域）像素逐一不变
-    assert np.array_equal(result.image_bgr[100:300, 100:300], canvas[100:300, 100:300]), \
+    # 图案本体（原方块区域）像素逐一不变——外环画法画布外扩 18px（第三十二次
+    # 修订），内容区平移到 [118:318]
+    assert np.array_equal(result.image_bgr[118:318, 118:318], canvas[100:300, 100:300]), \
         "描边覆盖了图案本体像素"
 
-    # （2026-08-25 形状必填）无 shape 回退 circle：线在整图内接圆缘（y=200 行
-    # 圆左缘 x≈0-18），不在方块外侧——图案本体仍零覆盖
+    # 无 shape 回退 rectangle：外环在最外圈 pad 带（y=200 行左缘 x≈0-17）
     row = result.image_bgr[200, :]
     gray_run = 0
     for x in range(0, 40):
@@ -159,8 +162,8 @@ def test_outline_threshold_fallback(test_settings):
     test_settings.outline_matting_enabled = False
     result = OutlineStep(test_settings).run(canvas)  # 无 shape → 回退 circle
     assert result.stage_value == "done"
-    # 图案本体保真；灰线在整图圆缘（y=200 行左缘）
-    assert np.array_equal(result.image_bgr[100:300, 100:300], canvas[100:300, 100:300])
+    # 图案本体保真（外扩 18px 偏移）；灰线在外环 pad 带（y=200 行左缘）
+    assert np.array_equal(result.image_bgr[118:318, 118:318], canvas[100:300, 100:300])
     row = result.image_bgr[200, 0:40, 0].astype(int)
     assert any(abs(int(v) - test_settings.outline_gray_level) <= 10 for v in row), "圆缘灰线缺失"
 
@@ -178,8 +181,9 @@ def test_outline_matting_mask_light_pattern_kept(test_settings):
     assert matting_mask_area > 0, "alpha 蒙版法应保留浅色图案"
 
 
-def test_crop_shape_gray_background_skipped(api_client: TestClient):
-    """口径：形状裁剪图也要求白底——灰底照片裁圆不描边（边界看得见，无需补线）。"""
+def test_crop_shape_gray_background_outer_ring(api_client: TestClient):
+    """第三十二次修订：外边缘描边无条件执行——灰底照片裁圆同样出外环线
+    （线环在形状外侧透明区上，永不接触内容；白底判定门随内缩画法退役）。"""
     gray_canvas = np.full((400, 400, 3), 215, dtype=np.uint8)  # 灰底
     success, buffer = cv2.imencode(".png", gray_canvas)
     assert success
@@ -190,7 +194,7 @@ def test_crop_shape_gray_background_skipped(api_client: TestClient):
     )
     assert response.status_code == 200
     job_status = wait_until_job_completed(api_client, response.json()["job_id"])
-    assert job_status["images"][0]["stage_results"]["outline"] == "skipped"
+    assert job_status["images"][0]["stage_results"]["outline"] == "done"
 
 
 def test_crop_shape_white_background_outlines_shape(api_client: TestClient):
@@ -211,16 +215,16 @@ def test_crop_shape_white_background_outlines_shape(api_client: TestClient):
     assert image_status["stage_results"]["outline"] == "done", "白底形状裁剪图应沿形状描线"
 
     download = api_client.get(image_status["result_url"])
-    result_bgr = cv2.imdecode(np.frombuffer(download.content, dtype=np.uint8), cv2.IMREAD_COLOR)
-    gray_line = np.all(np.abs(result_bgr.astype(int) - 190) <= 10, axis=2)
-    center_row = gray_line[200, :]
-    circle_edge_left = np.nonzero(center_row[:200])[0]
-    assert len(circle_edge_left) > 0, "圆左缘未见灰线"
-    # 线带起画 = 内接圆缘 + 羽化补偿 2px（第二十五次修订：resize 形状 alpha
-    # 羽化带吃线，起画内缩线宽+2px 厚度画足）——灰线延伸到 ≈12+2px 处
-    assert abs(circle_edge_left.max() - 14) <= 6, f"灰线应贴内接圆左缘内侧（≈14px 含羽化补偿），实际 {circle_edge_left.max()}"
-    corner = 20
-    assert not gray_line[:corner, :corner].any(), "画布角出现灰线，疑似矩形描边"
+    result_bgra = cv2.imdecode(np.frombuffer(download.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    # 第三十二次修订外环画法：画布外扩 18px（400→436），圆心 (218,218) r=200，
+    # 灰线环在外侧 r∈[200,218)——中线行左端 x∈[0,18) 全灰；内容区零灰线
+    gray_line = np.all(np.abs(result_bgra[:, :, :3].astype(int) - 190) <= 10, axis=2)
+    assert gray_line[218, 0:16].all(), "圆左缘外侧未见外环灰线"
+    assert not gray_line[60:160, 160:260].any(), "内容区出现灰线（线压内容）"
+    # 线外全部透明（远角距圆心 >218px）
+    assert result_bgra[0:10, 0:10, 3].max() < 10, "线外未透明"
+    # 图案本体保真：内容圆（(200,240) r55 原坐标 → (218,258) 外扩坐标）绿色不变
+    assert abs(int(result_bgra[258, 218, 0]) - 60) <= 10, "图案本体像素被改动"
 
 
 def test_crop_shape_square_draws_border_frame(api_client: TestClient):
@@ -240,18 +244,19 @@ def test_crop_shape_square_draws_border_frame(api_client: TestClient):
     assert image_status["stage_results"]["outline"] == "done"
 
     download = api_client.get(image_status["result_url"])
-    result_bgr = cv2.imdecode(np.frombuffer(download.content, dtype=np.uint8), cv2.IMREAD_COLOR)
-    gray_line = np.all(np.abs(result_bgr.astype(int) - 190) <= 10, axis=2)
-    # 四条边带都有灰线（边框带构造：内缩一个线宽起笔 18px，带宽 18px→行 18-35）
-    assert gray_line[18:34, 100:200].any(axis=1).all(), "顶边带无灰线"
-    assert gray_line[-34:-18, 100:200].any(axis=1).all(), "底边带无灰线"
-    assert gray_line[100:200, 18:34].any(axis=0).all(), "左边带无灰线"
-    assert gray_line[100:200, -34:-18].any(axis=0).all(), "右边带无灰线"
-    # 角不外凸；画布最外缘一圈无灰线（防打印裁边）；中心区无灰线
-    assert not gray_line[0:17, 0:17].any(), "左上角外凸"
-    assert not gray_line[0, :].any() and not gray_line[-1, :].any(), "灰线贴死画布上下边"
-    assert not gray_line[:, 0].any() and not gray_line[:, -1].any(), "灰线贴死画布左右边"
-    assert not gray_line[100:200, 100:200].any(), "中心区出现灰线"
+    result_bgra = cv2.imdecode(np.frombuffer(download.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    # 第三十二次修订：square 掩膜=全图（300 内接）→ 外环=画布外扩 18px 的整圈
+    # pad 边框（336 画布，行/列 0:17 与 318:335 全周灰线，含四角连续）
+    gray_line = np.all(np.abs(result_bgra[:, :, :3].astype(int) - 190) <= 10, axis=2)
+    assert result_bgra.shape[0] == 336, f"画布应外扩到 336，实际 {result_bgra.shape[0]}"
+    assert gray_line[0:16, 100:200].all(), "顶环带无灰线"
+    assert gray_line[320:336, 100:200].all(), "底环带无灰线"
+    assert gray_line[100:200, 0:16].all(), "左环带无灰线"
+    assert gray_line[100:200, 320:336].all(), "右环带无灰线"
+    # 四角为圆角环（等宽偏移曲线）：外角缺口透明、内角 6px 起环带连续
+    assert gray_line[6:16, 6:16].all(), "四角环带应连续（外环整圈，圆角）"
+    assert result_bgra[0, 0, 3] == 0, "外环圆角缺口应透明"
+    assert not gray_line[120:216, 120:216].any(), "中心区出现灰线"
 
 
 def test_batch_shape_square_rectfixed_nobox_shapes_image(api_client: TestClient):
@@ -298,13 +303,17 @@ def test_batch_shape_square_rectfixed_nobox_shapes_image(api_client: TestClient)
             assert (alpha[150:250, 50:250] == 255).all(), "rectangle-fixed 中心区应不透明"
 
 
-def test_crop_shape_unknown_falls_back_to_white_gate(api_client: TestClient):
-    """畸形/未知形状声明按未裁剪处理：灰底图无 crop_meta 等效路径 → outline=skipped。"""
+def test_crop_shape_unknown_falls_back_to_rectangle_outer_ring(api_client: TestClient):
+    """畸形/未知形状声明按 rectangle 处理（第三十二次修订）：无条件外环整圈。"""
     from src.steps.outline import OutlineStep
 
     gray_canvas = np.full((300, 300, 3), 215, dtype=np.uint8)
     result = OutlineStep(_stub_settings()).run(gray_canvas, crop_shape="weird-shape")
-    assert result.stage_value == "skipped"
+    assert result.stage_value == "done"
+    # 3 通道直调 → 白底合成回显，外环整圈可见（300+36=336）
+    assert result.image_bgr.shape[0] == 336
+    row = result.image_bgr[168, 0:16, 0].astype(int)
+    assert any(abs(int(v) - _stub_settings().outline_gray_level) <= 10 for v in row), "外环灰线缺失"
 
 
 def _stub_settings():
@@ -335,41 +344,46 @@ def test_shape_outline_cleans_bleed_outside_shape(tmp_path):
     canvas[:, :, :3][bleed_zone] = (70, 140, 100)
 
     outlined = draw_shape_outline(canvas, "circle", settings)
-    gray = cv2.cvtColor(outlined[:, :, :3], cv2.COLOR_BGR2GRAY)
-    # 清洗后：线带外沿与形状边界之间应为白（渗出色已被洗掉）
-    # 心形同理；此处 circle：取中线行验证边界附近
-    row = 100  # 非直径行：左右侧弧有真实边界（直径行贯穿全幅无下落沿）
+    # 第三十二次修订：渗出清洗随内缩画法退役——渗出色所在区（形状外）如今
+    # 要么被外环灰线覆盖、要么收口为 alpha=0（打印不可见），保护意图由
+    # 透明收口承接。中线行：外环之外（右端 alpha 下落沿之后）必须全透明
+    row = 100
     alpha = outlined[:, :, 3]
-    # 直径行：右边界（形状内→形状外的下落沿）
     trans = np.where((alpha[row, :-1] >= 128) & (alpha[row, 1:] < 128))[0]
-    assert len(trans), "应有形状边界"
+    assert len(trans), "应有环带外沿"
     c = trans[-1]
-    # 边界外侧 1-5px（原渗出区）：渗出色必须被洗白（alpha 已透明，颜色值本身干净）
-    outside_pixels = outlined[row, c+1:c+6, :3]
-    assert (outside_pixels >= 248).all(), f"边界外渗出色未清洗: {outside_pixels[:, 0].tolist()}"
+    assert (outlined[row, c+1:, 3] == 0).all(), "外环之外未收口透明（渗出可见）"
 
 
-def test_line_band_not_clear_skips_outline(test_settings):
-    """线带净空判定（第三十一次修订）：内容越线（大圆触边，压住线带）时
-    不画线——沿线剪会剪掉图案，裁切参考线语义失效。直接调 OutlineStep。"""
+def test_outer_ring_never_covers_content(test_settings):
+    """第三十二次修订核心回归：内容满幅到边（旧净空判定必拒的形态）也画线，
+    且内容像素逐一不变——外环在形状外侧，线永不接触内容。"""
     from src.steps.outline import OutlineStep
 
-    # 白底 + 居中大圆：半径 192（画布 400，边距 8px < 线宽内缩 14px 起）——
-    # 圆边压进矩形线带（inset 14..28px 行列带）→ 旧白底判定通过（剔图案后
-    # 背景白）、新净空判定必须拒绝
+    # 白底 + 大圆半径 192（边距 8px，满幅形态）：旧内缩画法线压圆边，旧净空
+    # 判定直接拒；新外环画法照画且内容零改动
     canvas = np.full((400, 400, 3), 255, dtype=np.uint8)
     cv2.circle(canvas, (200, 200), 192, (60, 140, 60), -1)
     bgra = cv2.cvtColor(canvas, cv2.COLOR_BGR2BGRA)
     result = OutlineStep(test_settings).run(bgra, "square")
-    assert result.stage_value == "skipped", "内容压线带必须 skipped（裁切线不可越内容）"
+    assert result.stage_value == "done", "外环画法应无条件画线"
+    assert result.image_bgr.shape[0] == 436, "画布应外扩一个线宽（400+2×18）"
+    # 内容区（外扩偏移 [18:418]）与输入逐一相等——零覆盖铁证
+    assert np.array_equal(result.image_bgr[18:418, 18:418, :3], canvas), "外环覆盖了内容像素"
+    # 外环在 pad 带上（最外圈 18px 灰线）
+    ring = result.image_bgr[200, 0:16, 0].astype(int)
+    assert any(abs(int(v) - test_settings.outline_gray_level) <= 10 for v in ring), "外环灰线缺失"
 
 
-def test_line_band_clear_small_pattern_draws(test_settings):
-    """对照组：内容离边 ≥40px（线带净空）时正常画线——净空判定不误杀。"""
+def test_outer_ring_transparent_beyond_line(test_settings):
+    """外环之外全部 alpha=0（第三十二次修订第三要点）——沿线剪=线随废料丢弃。"""
     from src.steps.outline import OutlineStep
 
     canvas = np.full((400, 400, 3), 255, dtype=np.uint8)
     cv2.circle(canvas, (200, 200), 150, (60, 140, 60), -1)
     bgra = cv2.cvtColor(canvas, cv2.COLOR_BGR2BGRA)
     result = OutlineStep(test_settings).run(bgra, "square")
-    assert result.stage_value == "done", "线带净空（内容不压线）应正常画线"
+    assert result.stage_value == "done"
+    alpha = result.image_bgr[:, :, 3]
+    # square 掩膜=全图 → 外环=整圈 pad 带；环带内 alpha=255（线可打印）
+    assert (alpha[0:16, 100:300] == 255).all(), "环带应不透明（灰线本体）"

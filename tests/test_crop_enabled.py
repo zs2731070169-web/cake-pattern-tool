@@ -49,8 +49,9 @@ def test_crop_disabled_passthrough(tmp_path):
     )
     assert stage_results.get("crop_applied") is None  # 未执行（skipped 无 applied 键）
     img = cv2.imdecode(np.frombuffer(result_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
-    # 未塑形：四角应不透明（若塑形了心形外 alpha=0）
-    assert img[0, 0, 3] == 255, "关闭裁剪后四角应保持不透明（原图直通）"
+    # 未塑形：原画布四角（外环画布外扩 18px 后平移到 (18,18)，第三十二次
+    # 修订）应不透明——若塑形了心形外 alpha=0
+    assert img[18, 18, 3] == 255, "关闭裁剪后原画布角应保持不透明（原图直通）"
 
 
 def test_crop_enabled_shapes_normally(tmp_path):

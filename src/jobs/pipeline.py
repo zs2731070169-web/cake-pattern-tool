@@ -319,7 +319,10 @@ class RetouchPipeline:
         # 灰线被拉出 LANCZOS 振铃锯齿 + 物理线宽漂 4 倍（2px→9.7px=0.82mm，
         # 配置 0.2mm），心形真图实锤。白底判定与 rembg 分割随之在高幅跑，
         # 分割质量更好，代价 rembg 大图耗时 +1-2s）。
-        outline_result = self._outline_step.run(image_bgr, crop_shape)
+        # crop 关闭（第二十次修订"不裁框不塑形原图直通"）时描边不施加形状——
+        # 外环画法（第三十二次修订）会按形状雕透明，违背直通契约；回退 rectangle
+        outline_shape = crop_shape if self._settings.crop_enabled else None
+        outline_result = self._outline_step.run(image_bgr, outline_shape)
         image_bgr = outline_result.image_bgr
         stage_results["outline"] = outline_result.stage_value
 
