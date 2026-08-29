@@ -189,6 +189,12 @@
     #result-panel .panel-head h2 { margin-bottom: 0; }
     #result-panel .panel-head .head-actions { display: flex; gap: 8px; align-items: center; }
     #result-panel .panel-head .head-actions .danger-ghost { color: #c0392b; background: #fff; border: 1px solid #f0c8c8; }
+    /* 打包进度提示（2026-08-30 自独立反馈条移入标题行，批量下载左侧）：
+       默认隐藏瞬时显示；长文案截断不挤按钮（min-width:0 允许收缩） */
+    #batch-status {
+      display: none; font-size: 12px; color: #888; min-width: 0;
+      max-width: 190px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
 
     /* ---- 顶部小弹窗 toast（2026-08-27：按钮反馈统一入口——下载/删除/复制
        的结果提示不再原地改文字，顶部滑入自动消失） ---- */
@@ -219,7 +225,15 @@
       background: repeating-conic-gradient(#eee 0 25%, #fff 0 50%) 0 0/16px 16px;
     }
     #result-zoom-layer.active { display: block; }
-    #result-zoom-layer img { display: block; max-width: none; max-height: none; }
+    /* 双层渐进（第四十次修订补）：底层预览（卡片已缓存→即时上屏）、顶层
+       全幅（隧道慢，onload 淡入）；换卡立即撤旧全幅——绝不显示过期图 */
+    #result-zoom-layer { width: 0; height: 0; }
+    #result-zoom-layer img {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      display: block; max-width: none; max-height: none;
+    }
+    #result-zoom-layer img.zoom-full { opacity: 0; transition: opacity .12s ease-out; }
+    #result-zoom-layer img.zoom-full.loaded { opacity: 1; }
     .image-card .thumb-wrap.zoomable { cursor: zoom-in; }
     /* 上传卡片 hover 反馈（2026-08-27：鼠标扫过有轻微抬升，列表可交互感） */
     .image-card:hover { border-color: #b8c2d0; }
@@ -291,14 +305,12 @@
              下载=当前结果打包 ZIP，删除=删除勾选；有结果才可用；
              第三十七次修订追加"取消任务"——仅处理中可用，放弃等待回引导态） -->
         <div class="head-actions" id="result-head-actions">
+          <!-- 打包进度/结果提示（2026-08-30 移入标题行，批量下载左侧；瞬时显示） -->
+          <span id="batch-status"></span>
           <button id="batch-download-button" disabled>批量下载</button>
           <button id="batch-delete-button" class="danger-ghost" disabled>批量删除</button>
           <button id="cancel-job-button" class="ghost" disabled>取消任务</button>
         </div>
-      </div>
-      <!-- 过程反馈条（打包进度等瞬时提示；常驻引导文案已撤） -->
-      <div id="batch-actions" style="display: none; margin-bottom: 10px; gap: 8px;">
-        <span id="batch-status" style="font-size: 12px; color: #888; line-height: 34px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></span>
       </div>
       <div class="image-list" id="result-list"></div>
       <div id="restart-row" style="margin-top: 14px; display:flex; gap:10px;">
@@ -328,8 +340,9 @@
     </div>
   </div>
 
-  <!-- 结果图悬停放大浮层（跟随鼠标，桌面专用；触屏无 hover 自动不触发） -->
-  <div id="result-zoom-layer"><img alt="放大查看"></div>
+  <!-- 结果图悬停放大浮层（跟随鼠标，桌面专用；触屏无 hover 自动不触发）。
+       双层渐进（第四十次修订补）：preview 垫底即时 + full 淡入替换 -->
+  <div id="result-zoom-layer"><img class="zoom-preview" alt=""><img class="zoom-full" alt="放大查看"></div>
 
   <!-- 顶部小弹窗（按钮反馈：下载/删除/复制结果提示） -->
   <div id="toast-layer"></div>

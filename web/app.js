@@ -1099,8 +1099,9 @@
       batchDownloadButton.disabled = batchResultUrls.length === 0;
     }
     var batchContainer = document.getElementById('batch-actions');
-    batchContainer.style.display = 'none';
+    if (batchContainer) batchContainer.style.display = 'none'; // 旧容器已撤（防御性兼容）
     if (batchStatus) {
+      batchStatus.style.display = 'none'; // 进度提示移标题行（2026-08-30），随渲染复位
       batchStatus.textContent = '';
     }
     updateDeleteButtonState();
@@ -1108,17 +1109,43 @@
 
   // 批量下载：ZIP 打包单文件落盘（2026-08-26 16:55 改版——旧逐张 a[download]
   // 被浏览器多文件拦截 + 逐张询问；ZIP 一次点击一个文件，解压即得全部独立 PNG）
+  // 第三十九次修订：进度可见化 + 3 路并发拉取——旧版进度文案写在被
+  // updateBatchActions 无条件 display:none 的容器里（用户实锤"点了没反应"），
+  // 且 9 张大图逐张串行 fetch 走隧道（家宽上行瓶颈）全部拉完才弹下载。
   if (batchDownloadButton) {
     batchDownloadButton.addEventListener('click', async function () {
       if (!batchResultUrls.length) return;
       batchDownloadButton.disabled = true;
-      if (batchStatus) batchStatus.textContent = '打包中（' + batchResultUrls.length + ' 张）…';
+      // 打包反馈显示（2026-08-30 移入标题行批量下载左侧；此前独立反馈条恒
+      // display:none——进度文案不可见即"按钮没反应"）。显式 inline：CSS 基态
+      // 是 display:none，置 '' 会回落基态仍隐藏
+      if (batchStatus) batchStatus.style.display = 'inline';
+      if (batchStatus) batchStatus.textContent = '打包中（0/' + batchResultUrls.length + ' 张）…';
       try {
+        // 3 路并发 worker 池逐张拉取（隧道 tcpMux 单连接下串行是纯排队），
+        // 完成一张回填一张；任一张失败即中止（catch 统一提示逐张下载）
+        var fetchedBytes = new Array(batchResultUrls.length);
+        var fetchedCount = 0;
+        var fetchCursor = 0;
+        async function fetchNext() {
+          while (fetchCursor < batchResultUrls.length) {
+            var index = fetchCursor++;
+            var response = await fetch(batchResultUrls[index].url);
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            fetchedBytes[index] = new Uint8Array(await response.arrayBuffer());
+            fetchedCount++;
+            if (batchStatus) {
+              batchStatus.textContent = '打包中（' + fetchedCount + '/' + batchResultUrls.length + ' 张）…';
+            }
+          }
+        }
+        var workerCount = Math.min(3, batchResultUrls.length);
+        var workers = [];
+        for (var w = 0; w < workerCount; w++) workers.push(fetchNext());
+        await Promise.all(workers);
         var builder = StoreZip.builder();
         for (var i = 0; i < batchResultUrls.length; i++) {
-          var response = await fetch(batchResultUrls[i].url);
-          var bytes = new Uint8Array(await response.arrayBuffer());
-          builder.add('pattern_' + batchResultUrls[i].seq + '.png', bytes);
+          builder.add('pattern_' + batchResultUrls[i].seq + '.png', fetchedBytes[i]);
         }
         var zipBlob = builder.build();
         var zipUrl = URL.createObjectURL(zipBlob);
@@ -1237,13 +1264,23 @@
 
       var resultImage = document.createElement('img');
       resultImage.className = 'thumb';
-      // 分辨率格回填：先挂 load 再赋 src（缓存图同步完成解码，后挂会错过事件）
+      // 缩略图走 512px 预览（第四十次修订：回显不拉全幅成品，隧道下行字节量
+      // 降 30~100 倍）；分辨率标签优先取接口 result_width/height（PNG 头直读），
+      // 旧批次无字段回落 naturalWidth 反推。悬停放大/下载/复制仍用全幅。
+      // load 监听恒挂（2026-08-30 用户定案）：缩略图显示完成才置 thumbLoaded
+      // 标记——悬停放大只在标记就绪后弹（缩略图没显示完不出浮层）。
+      var dimsTagFilled = false;
+      if (resizeTagToFill && imageStatus.result_width && imageStatus.result_height) {
+        resizeTagToFill.textContent = '分辨率:' + imageStatus.result_width + '×' + imageStatus.result_height;
+        dimsTagFilled = true;
+      }
       resultImage.addEventListener('load', function () {
-        if (resizeTagToFill && resultImage.naturalWidth) {
+        thumbWrap.dataset.thumbLoaded = '1';
+        if (resizeTagToFill && !dimsTagFilled && resultImage.naturalWidth) {
           resizeTagToFill.textContent = '分辨率:' + resultImage.naturalWidth + '×' + resultImage.naturalHeight;
         }
       });
-      resultImage.src = imageStatus.result_url;
+      resultImage.src = imageStatus.result_url + '?preview=1';
       thumbWrap.appendChild(resultImage);
       attachResultZoom(thumbWrap, imageStatus.result_url);
 
@@ -1327,14 +1364,18 @@
   // ---- 结果图悬停放大（桌面 hover 查看细节；触屏无 hover 不触发，pointer-events:none 不打断点击/长按） ----
 
   var resultZoomLayer = document.getElementById('result-zoom-layer');
-  var resultZoomImage = resultZoomLayer ? resultZoomLayer.querySelector('img') : null;
+  var resultZoomPreviewImage = resultZoomLayer ? resultZoomLayer.querySelector('img.zoom-preview') : null;
+  var resultZoomFullImage = resultZoomLayer ? resultZoomLayer.querySelector('img.zoom-full') : null;
   var ZOOM_VIEW_MAX = 800; // 浮层最大边（px）——2026-08-27 桌面端 480→800：缩略图可辨修图质量
   var ZOOM_VIEW_MARGIN = 16; // 距视口边距
 
-  // 悬停放大（2026-08-27 定案：立即放大——勾选框已移出缩略图到信息栏，
-  // 冲突源消失，延迟门槛（曾 150ms→1.5s→800ms）全线撤销，mouseenter 即出图）
+  // 悬停放大（2026-08-27 定案：立即放大——mouseenter 即出图）。第四十次
+  // 修订补改双层渐进：缩略图改 512px 预览后，全幅不再被卡片预载进缓存，
+  // 旧单层 img 换 src 在新图经隧道下载完成前会持续显示上一张已加载图
+  // （用户实锤"看谁都是上一只狗"）——现 preview 垫底（缓存命中即时上屏
+  // 正确内容）+ full 异步 onload 淡入；换卡立即撤旧全幅，绝不显示过期图
   function attachResultZoom(thumbWrap, imageUrl) {
-    if (!resultZoomLayer || !resultZoomImage) return;
+    if (!resultZoomLayer || !resultZoomPreviewImage || !resultZoomFullImage) return;
     thumbWrap.classList.add('zoomable');
     // 悬停放大角标（2026-08-27：hover 浮层此前无入口提示，不可发现）
     var zoomHint = document.createElement('span');
@@ -1349,7 +1390,26 @@
     thumbWrap.addEventListener('mouseenter', function () {
       clearTimeout(hoverTimer);
       hoverTimer = setTimeout(function () {
-        if (resultZoomImage.getAttribute('src') !== imageUrl) resultZoomImage.src = imageUrl;
+        // 缩略图未显示完不弹（2026-08-30 用户定案：thumbLoaded 由缩略图 load
+        // 置位——没显示完的卡悬停无效，避免放大出糊图/错位观感）
+        if (thumbWrap.dataset.thumbLoaded !== '1') return;
+        // 撤旧全幅（防过期图残留）→ 预览垫底即时 → 全幅 onload 淡入替换
+        resultZoomFullImage.classList.remove('loaded');
+        resultZoomPreviewImage.src = imageUrl + '?preview=1';
+        if (resultZoomFullImage.getAttribute('src') === imageUrl
+            && resultZoomFullImage.complete && resultZoomFullImage.naturalWidth > 0) {
+          // 同 src 复悬停：Safari 等浏览器对相同 src 不重发 load 事件——
+          // 已加载完成的全幅直接上屏（onload 依赖会永远停在预览层）
+          resultZoomFullImage.classList.add('loaded');
+        } else {
+          resultZoomFullImage.onload = function () {
+            if (resultZoomFullImage.getAttribute('src') === imageUrl) {
+              resultZoomFullImage.classList.add('loaded');
+              positionResultZoom();
+            }
+          };
+          resultZoomFullImage.src = imageUrl;
+        }
         resultZoomLayer.classList.add('active');
         positionResultZoom();
       }, 200);
@@ -1381,14 +1441,15 @@
     var pointer = event || window.event;
     var viewportWidth = window.innerWidth;
     var viewportHeight = window.innerHeight;
-    // 浮层尺寸按图片自然尺寸钳制（首帧未加载完成时用当前显示尺寸）
-    var naturalWidth = resultZoomImage.naturalWidth || ZOOM_VIEW_MAX;
-    var naturalHeight = resultZoomImage.naturalHeight || ZOOM_VIEW_MAX;
+    // 浮层尺寸按图片自然宽高比钳制（第四十次修订补：双层 img 铺满浮层，
+    // 尺寸定在浮层上；宽高比取预览——垫底必先加载，与全幅同比例）
+    var naturalWidth = (resultZoomPreviewImage && resultZoomPreviewImage.naturalWidth) || ZOOM_VIEW_MAX;
+    var naturalHeight = (resultZoomPreviewImage && resultZoomPreviewImage.naturalHeight) || ZOOM_VIEW_MAX;
     var scale = Math.min(1, ZOOM_VIEW_MAX / Math.max(naturalWidth, naturalHeight));
     var viewWidth = Math.max(120, Math.round(naturalWidth * scale));
     var viewHeight = Math.max(120, Math.round(naturalHeight * scale));
-    resultZoomImage.style.width = viewWidth + 'px';
-    resultZoomImage.style.height = viewHeight + 'px';
+    resultZoomLayer.style.width = viewWidth + 'px';
+    resultZoomLayer.style.height = viewHeight + 'px';
     // 位置：鼠标右下方，越界翻转到左/上
     var pointerX = pointer && typeof pointer.clientX === 'number' ? pointer.clientX : viewportWidth / 2;
     var pointerY = pointer && typeof pointer.clientY === 'number' ? pointer.clientY : viewportHeight / 2;
@@ -1401,7 +1462,19 @@
   }
 
   function hideResultZoom() {
-    if (resultZoomLayer) resultZoomLayer.classList.remove('active');
+    if (!resultZoomLayer) return;
+    resultZoomLayer.classList.remove('active');
+    // 清空放大弹窗缓存（2026-08-30 用户定案）：撤源+撤 loaded+断 onload——
+    // 下次悬停从零加载（缓存命中即时），无过期图残留、无同 src 不重发
+    // load 的兼容坑（removeAttribute 不触发请求；src='' 会打页面 URL，禁用）
+    if (resultZoomFullImage) {
+      resultZoomFullImage.onload = null;
+      resultZoomFullImage.classList.remove('loaded');
+      resultZoomFullImage.removeAttribute('src');
+    }
+    if (resultZoomPreviewImage) {
+      resultZoomPreviewImage.removeAttribute('src');
+    }
   }
 
   // ---- 免责声明与限制（GET /api/meta，11 号验收） ----

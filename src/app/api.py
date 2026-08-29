@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -34,6 +35,8 @@ from src.jobs.store import JobStore, _format_utc, utc_now
 from src.steps.imaging import ImageDecodeError, probe_image_size
 
 module_logger = logging.getLogger("pattern_tool.api")
+
+_RESULT_PREVIEW_MAX_SIDE = 512  # 回显预览最长边（卡片 ~200px×2 DPR 覆盖；第四十次修订）
 
 # 免责声明文案（需求解读 7 章版权合规红线；启用远程 API 档时附第三方传输告知）
 DISCLAIMER_TEXT = (
@@ -72,6 +75,14 @@ class ImageStatusDTO(BaseModel):
     stage_results: dict[str, str] = Field(description="watermark/fill/outline → done/skipped/fallback")
     quality_hint: str = Field(description="none / heavy-watermark（low-res 已撤 2026-08-27）")
     result_url: str | None = Field(default=None, description="completed 时有值（相对路径）")
+    result_width: int | None = Field(
+        default=None,
+        description="成品宽（px；completed 且文件在时有值——PNG 头直读。第四十次修订：缩略图回显分辨率标签的依据，前端不再靠加载全幅反推）",
+    )
+    result_height: int | None = Field(
+        default=None,
+        description="成品高（px；completed 且文件在时有值）",
+    )
     error_msg: str | None = Field(default=None, description="failed 时有值（脱敏话术）")
     started_at: str | None = Field(
         default=None,
@@ -121,6 +132,57 @@ def get_client_ip(request: Request) -> str:
 def validation_error(detail_message: str) -> HTTPException:
     """422：张数/类型/大小/像素不合规（中文原因）。"""
     return HTTPException(status_code=422, detail=detail_message)
+
+
+def _png_dimensions(png_path) -> tuple[int | None, int | None]:
+    """PNG IHDR 头直读宽高（8 签名 + 4 长度 + 4 'IHDR' + 4 宽 + 4 高 = 24 字节），
+    不解码整图——状态轮询给缩略图回填分辨率，零解码开销（第四十次修订）。
+    非 PNG/读失败 → (None, None)（轮询不因此报错）。"""
+    try:
+        with open(png_path, "rb") as png_file:
+            header = png_file.read(24)
+        if len(header) >= 24 and header[:8] == b"\x89PNG\r\n\x1a\n" and header[12:16] == b"IHDR":
+            return int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
+    except OSError:
+        pass
+    return None, None
+
+
+def _result_preview_path(result_absolute_path):
+    """成品旁的预览缓存路径（*_preview.png；随任务目录由 24h TTL 统一清理，
+    非 data/cache 目录不入 ttl.py 登记）。"""
+    return result_absolute_path.with_name(result_absolute_path.stem + "_preview.png")
+
+
+def _ensure_result_preview(result_absolute_path, preview_absolute_path) -> Path:
+    """生成（或复用）最长边 512px 的预览 PNG（保 alpha 通道）——回显缩略图
+    不拉全幅（第四十次修订）。成品本身 ≤512px 直通原文件；并发首击双写由
+    tmp+os.replace 原子收口（后写胜，读到任一完整版本皆有效）。"""
+    import os
+
+    import cv2
+
+    if preview_absolute_path.exists():
+        return preview_absolute_path
+    image = cv2.imread(str(result_absolute_path), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        return result_absolute_path  # 解码失败兜底直通成品
+    longest = max(image.shape[0], image.shape[1])
+    if longest <= _RESULT_PREVIEW_MAX_SIDE:
+        return result_absolute_path
+    scale = _RESULT_PREVIEW_MAX_SIDE / longest
+    preview = cv2.resize(
+        image,
+        (max(1, round(image.shape[1] * scale)), max(1, round(image.shape[0] * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+    encoded, buffer = cv2.imencode(".png", preview)
+    if not encoded:
+        return result_absolute_path
+    tmp_path = preview_absolute_path.with_suffix(".tmp.png")
+    tmp_path.write_bytes(buffer.tobytes())
+    os.replace(tmp_path, preview_absolute_path)
+    return preview_absolute_path
 
 
 def ensure_job_exists(job_id: str, store: JobStore):
@@ -295,6 +357,7 @@ def create_job(
 def get_job_status(
     job_id: str,
     store: JobStore = Depends(get_job_store),
+    effective_settings: PatternToolSettings = Depends(get_settings),
 ) -> JobStatusResponse:
     job_record = ensure_job_exists(job_id, store)
     image_records = store.get_job_images(job_id)
@@ -307,6 +370,13 @@ def get_job_status(
             key: value for key, value in image_record.stage_results.items()
             if key in ("watermark", "fill", "outline", "crop", "resize", "crop_applied")
         }
+        # 成品宽高（第四十次修订）：PNG 头直读——缩略图回显的分辨率标签依据，
+        # 前端不再靠加载全幅反推；文件已被 TTL 清理时为 None
+        result_width = result_height = None
+        if image_record.status == "completed" and image_record.result_path:
+            result_width, result_height = _png_dimensions(
+                effective_settings.resolve_data_dir() / image_record.result_path
+            )
         image_dtos.append(
             ImageStatusDTO(
                 image_id=image_record.image_id,
@@ -319,6 +389,8 @@ def get_job_status(
                     if image_record.status == "completed"
                     else None
                 ),
+                result_width=result_width,
+                result_height=result_height,
                 error_msg=image_record.error_msg,
                 started_at=_format_utc(image_record.started_at) if image_record.started_at else None,
                 finished_at=_format_utc(image_record.finished_at) if image_record.finished_at else None,
@@ -339,9 +411,12 @@ def get_job_status(
 def download_result(
     job_id: str,
     image_id: str,
+    preview: bool = False,
     store: JobStore = Depends(get_job_store),
     effective_settings: PatternToolSettings = Depends(get_settings),
 ) -> FileResponse:
+    """成品下载（默认全幅）；preview=true 走最长边 512px 缓存预览（第四十次
+    修订——回显缩略图不拉全幅，悬停放大/下载/复制仍由调用方拿全幅）。"""
     ensure_job_exists(job_id, store)
     image_record = store.get_image(image_id)
     if image_record is None:
@@ -354,6 +429,10 @@ def download_result(
     result_absolute_path = effective_settings.resolve_data_dir() / image_record.result_path
     if not result_absolute_path.exists():
         raise HTTPException(status_code=404, detail="结果文件不存在或已清理")
+    if preview:
+        # 预览不带 filename（inline——img 标签直用；带 filename 会变附件下载）
+        preview_path = _ensure_result_preview(result_absolute_path, _result_preview_path(result_absolute_path))
+        return FileResponse(preview_path, media_type="image/png")
     return FileResponse(result_absolute_path, media_type="image/png", filename=f"pattern_{image_record.seq}.png")
 
 
