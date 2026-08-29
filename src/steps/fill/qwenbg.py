@@ -31,6 +31,7 @@ import cv2
 import httpx
 import numpy as np
 
+from src.core.api_throttle import provider_slot
 from src.core.config import PatternToolSettings
 from src.core.http import get_http_client, http_sync
 
@@ -82,6 +83,12 @@ class QwenBackgroundReplacer:
 
     def replace_background(self, image_bgr: np.ndarray) -> np.ndarray | None:
         """整幅背景替换为纯白；返回原幅 BGR；任何失败/超时返回 None（不抛出）。"""
+        # 并发闸（第三十八次修订）：任务周期整体排队（上传+生成+轮询+下载）
+        # ——闸在时钟之前获取，排队时间不吃 fill_gen_timeout_seconds 预算
+        with provider_slot("dashscope", self._settings.dashscope_max_concurrent):
+            return self._replace_background_cycle(image_bgr)
+
+    def _replace_background_cycle(self, image_bgr: np.ndarray) -> np.ndarray | None:
         started_at = time.monotonic()
         deadline_timestamp = started_at + self._settings.fill_gen_timeout_seconds
         try:

@@ -36,6 +36,7 @@ import cv2
 import httpx
 import numpy as np
 
+from src.core.api_throttle import provider_slot
 from src.core.config import PatternToolSettings
 from src.core.http import get_http_client, http_sync
 
@@ -57,46 +58,49 @@ class ShiliuWatermarkRemover:
 
     def remove_watermark(self, image_bgr: np.ndarray) -> np.ndarray | None:
         """高级自动去水印（检测+修复一体，异步提交+轮询）；返回原幅 BGR；任何失败/超时返回 None。"""
-        started_at = time.monotonic()
-        deadline = started_at + self._settings.shiliu_timeout_seconds
-        try:
-            ok, buf = cv2.imencode(".jpg", image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
-            image_base64 = base64.b64encode(buf.tobytes()).decode("ascii")
+        # 并发闸（第三十八次修订）：任务周期整体排队（提交+轮询）——闸在
+        # 时钟之前获取，排队时间不吃 shiliu_timeout_seconds 轮询预算
+        with provider_slot("shiliu", self._settings.shiliu_max_concurrent):
+            started_at = time.monotonic()
+            deadline = started_at + self._settings.shiliu_timeout_seconds
+            try:
+                ok, buf = cv2.imencode(".jpg", image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                image_base64 = base64.b64encode(buf.tobytes()).decode("ascii")
 
-            data = self._call_async(image_base64, deadline)
-            if data.get("code") != 0 or not data.get("result_base64"):
+                data = self._call_async(image_base64, deadline)
+                if data.get("code") != 0 or not data.get("result_base64"):
+                    module_logger.warning(
+                        "shiliu api failed after %.1fs: code=%s msg=%s",
+                        time.monotonic() - started_at, data.get("code"),
+                        data.get("msg_cn") or data.get("msg"),
+                    )
+                    return None
+
+                result_bytes = base64.b64decode(data["result_base64"])
+                result_bgr = cv2.imdecode(
+                    np.frombuffer(result_bytes, dtype=np.uint8), cv2.IMREAD_COLOR
+                )
+                if result_bgr is None:
+                    module_logger.warning("shiliu result_base64 decode failed")
+                    return None
+                # 返回 jpg 不改幅面；异常幅面（服务端裁切防御）缩回原幅
+                if result_bgr.shape[:2] != image_bgr.shape[:2]:
+                    result_bgr = cv2.resize(
+                        result_bgr,
+                        (image_bgr.shape[1], image_bgr.shape[0]),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                module_logger.info(
+                    "shiliu task done in %.1fs (image_id=%s)",
+                    time.monotonic() - started_at, data.get("image_id"),
+                )
+                return result_bgr
+            except (httpx.HTTPError, ValueError, KeyError) as api_error:
                 module_logger.warning(
-                    "shiliu api failed after %.1fs: code=%s msg=%s",
-                    time.monotonic() - started_at, data.get("code"),
-                    data.get("msg_cn") or data.get("msg"),
+                    "shiliu api error after %.1fs: %s",
+                    time.monotonic() - started_at, api_error,
                 )
                 return None
-
-            result_bytes = base64.b64decode(data["result_base64"])
-            result_bgr = cv2.imdecode(
-                np.frombuffer(result_bytes, dtype=np.uint8), cv2.IMREAD_COLOR
-            )
-            if result_bgr is None:
-                module_logger.warning("shiliu result_base64 decode failed")
-                return None
-            # 返回 jpg 不改幅面；异常幅面（服务端裁切防御）缩回原幅
-            if result_bgr.shape[:2] != image_bgr.shape[:2]:
-                result_bgr = cv2.resize(
-                    result_bgr,
-                    (image_bgr.shape[1], image_bgr.shape[0]),
-                    interpolation=cv2.INTER_AREA,
-                )
-            module_logger.info(
-                "shiliu task done in %.1fs (image_id=%s)",
-                time.monotonic() - started_at, data.get("image_id"),
-            )
-            return result_bgr
-        except (httpx.HTTPError, ValueError, KeyError) as api_error:
-            module_logger.warning(
-                "shiliu api error after %.1fs: %s",
-                time.monotonic() - started_at, api_error,
-            )
-            return None
 
     # ---- 内部两步 ----
 

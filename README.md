@@ -79,6 +79,7 @@ docs/plan/        # 技术方案文档（口径真源，改代码先改文档）
 | `PT_WM_PRECHECK_KEY` / `PT_SHILIU_API_KEY` | 百炼 VL 预检 / 石榴去水印 Key | 空（未配则对应步跳过） |
 | `PT_PICWISH_API_KEY` | 佐糖 scale-pro 变清晰 Key | 空（未配则放大 failed） |
 | `PT_FILL_GEN_KEY` | 百炼 qwen-image 换白底 Key | 空（未配则填充跳过） |
+| `PT_PICWISH_MAX_CONCURRENT` / `PT_DASHSCOPE_MAX_CONCURRENT` / `PT_SHILIU_MAX_CONCURRENT` | 第三方 API 并发闸（在途任务上限，超额排队防 429；0=不限） | 3 / 4 / 2 |
 | `PT_CROP_ENABLED` | 是否执行声明式裁剪（关 = 原图直通不塑形） | true |
 | `PT_OUTLINE_WIDTH_MM` | 描边线宽（毫米） | 1.5 |
 | `PT_JOB_TTL_HOURS` | 批次保留时长 | 24 |

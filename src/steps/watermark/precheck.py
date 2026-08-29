@@ -15,6 +15,7 @@ import cv2
 import httpx
 import numpy as np
 
+from src.core.api_throttle import provider_slot
 from src.core.config import PatternToolSettings
 from src.core.http import get_http_client, http_sync
 
@@ -79,6 +80,12 @@ class WatermarkPrecheck:
 
     def _ask_vl(self, image_bgr: np.ndarray, prompt: str) -> str | None:
         """qwen-vl 视觉问答公共通道：上传图 → 同步问答 → 回答文本；失败 None。"""
+        # 并发闸（第三十八次修订）：单次 VL 问答（含 OSS 上传）整体排队，
+        # 与 CheckerboardGate/填充共用 dashscope 供应商限额
+        with provider_slot("dashscope", self._settings.dashscope_max_concurrent):
+            return self._ask_vl_cycle(image_bgr, prompt)
+
+    def _ask_vl_cycle(self, image_bgr: np.ndarray, prompt: str) -> str | None:
         try:
             oss_url = self._upload_image(image_bgr)
             response = http_sync(self._http.post(

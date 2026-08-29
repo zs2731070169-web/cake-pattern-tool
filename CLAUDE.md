@@ -52,6 +52,7 @@ C 端自助修图工具：上传 1-9 张图 → 五步管线 → 透明 PNG 成�
 - 管线主体跑在 ThreadPoolExecutor 线程里（API 事件循环之外），步骤代码是同步的。
 - **API 四接口全部是同步 `def`（2026-08-28 第二十三次修订）**——不要改回 `async def`：async 函数体会直接跑在 uvicorn 事件循环上，体内的 SQLite/文件/图像编解码同步调用会卡住全站（建批 9 张 3600² 图实测连续卡 1–4s）。同步 def 由 FastAPI 自动 `run_in_threadpool` 丢入 anyio 线程池；UploadFile 读取用 `upload_file.file.read()`（同步体内不能 await）。
 - 所有外部 HTTP 必须走 `src/core/http.py::http_sync(coroutine)`——协程提交到**全进程唯一后台事件循环线程**执行。"每线程各建 loop"的旧模型会在批次并行下抛 "bound to a different event loop"（共享 AsyncClient 连接绑定首个使用线程的循环）。绝不在调用方线程 `run_until_complete`（uvicorn 主线程自带运行中的循环会炸）。
+- 第三方 API 外呼（佐糖/百炼/石榴）必须套 `src/core/api_throttle.py::provider_slot(provider, limit)` 并发闸——任务周期粒度排队（提交-轮询-下载整体），`PT_{PICWISH,DASHSCOPE,SHILIU}_MAX_CONCURRENT`（0=不限）。批内并行下 9 路佐糖提交实测 429（2026-08-29 第三十八次修订），新增外部 API 客户端同规则挂闸。
 - SQLite 连接按 **每线程每库路径** 一条（`threading.local` 字典，`src/core/database.py`），写事务由 `JobStore._write_lock` 串行化。测试逐 `tmp_path` 新库天然隔离，不要做全局 reset（会死锁，2026-08-26 实测）。
 - 批内图片**并行**处理（2026-08-28 第二十六次修订，撤销 2026-08-26 串行定案——当年翻车根因是无条件完成回写竞态，非并行本身）：每图独立投递 core 池；完成回写走 `try_complete_image`（`WHERE status='processing'` 条件更新），终态单向在 DB 层闭环；链头双 VL（棋盘格+水印预检）入口并发问 + 判定复用（fill-first 下预检不复用——生成图域答案不成立）；五步本体仍严格串行（原始域原则 + 描边必须在缩放后）。
 - 重启恢复：启动时悬挂 `processing/queued` 图自动置 failed（话术"服务重启中断，请重新提交"）。

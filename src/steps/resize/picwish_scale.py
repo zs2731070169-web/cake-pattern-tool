@@ -28,6 +28,7 @@ import cv2
 import httpx
 import numpy as np
 
+from src.core.api_throttle import provider_slot
 from src.core.config import PatternToolSettings
 from src.core.http import get_http_client, http_sync
 
@@ -51,41 +52,45 @@ class PicwishScalePro:
 
     def upscale(self, image_bgr: np.ndarray) -> np.ndarray | None:
         """变清晰放大（服务端决定倍率，实测小图出 2048 级）；失败 None。"""
-        started_at = time.monotonic()
-        deadline = started_at + self._settings.picwish_timeout_seconds
-        try:
-            task_id = self._submit(image_bgr)
-            module_logger.info("scale-pro task %s submitted", task_id)
-            while time.monotonic() < deadline:
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                data = self._poll(task_id)
-                state = data.get("state")
-                if state == 1:
-                    image_url = data.get("image") or data.get("file")
-                    if not image_url:
+        # 并发闸（第三十八次修订）：任务周期整体排队（提交-轮询-下载）——
+        # 批内并行下 9 路并发提交实测 429；闸在时钟**之前**获取，排队时间
+        # 不吃 picwish_timeout_seconds 轮询预算
+        with provider_slot("picwish", self._settings.picwish_max_concurrent):
+            started_at = time.monotonic()
+            deadline = started_at + self._settings.picwish_timeout_seconds
+            try:
+                task_id = self._submit(image_bgr)
+                module_logger.info("scale-pro task %s submitted", task_id)
+                while time.monotonic() < deadline:
+                    time.sleep(_POLL_INTERVAL_SECONDS)
+                    data = self._poll(task_id)
+                    state = data.get("state")
+                    if state == 1:
+                        image_url = data.get("image") or data.get("file")
+                        if not image_url:
+                            return None
+                        module_logger.info(
+                            "scale-pro task %s done in %.1fs", task_id, time.monotonic() - started_at
+                        )
+                        return self._download(image_url)
+                    if state is not None and state < 0:  # 仅负值=失败；0/2/4=进行中
+                        module_logger.warning("scale-pro task failed: %s", data.get("state_detail"))
                         return None
-                    module_logger.info(
-                        "scale-pro task %s done in %.1fs", task_id, time.monotonic() - started_at
-                    )
-                    return self._download(image_url)
-                if state is not None and state < 0:  # 仅负值=失败；0/2/4=进行中
-                    module_logger.warning("scale-pro task failed: %s", data.get("state_detail"))
-                    return None
-                elapsed = time.monotonic() - started_at
-                if int(elapsed) % 10 < _POLL_INTERVAL_SECONDS:
-                    module_logger.info(
-                        "scale-pro task %s polling %.0fs (state=%s)", task_id, elapsed, state
-                    )
-            module_logger.warning(
-                "scale-pro task %s timeout after %.0fs", task_id, time.monotonic() - started_at
-            )
-            return None
-        except (httpx.HTTPError, ValueError, KeyError) as scale_error:
-            module_logger.warning(
-                "scale-pro api failed after %.1fs: %s",
-                time.monotonic() - started_at, scale_error,
-            )
-            return None
+                    elapsed = time.monotonic() - started_at
+                    if int(elapsed) % 10 < _POLL_INTERVAL_SECONDS:
+                        module_logger.info(
+                            "scale-pro task %s polling %.0fs (state=%s)", task_id, elapsed, state
+                        )
+                module_logger.warning(
+                    "scale-pro task %s timeout after %.0fs", task_id, time.monotonic() - started_at
+                )
+                return None
+            except (httpx.HTTPError, ValueError, KeyError) as scale_error:
+                module_logger.warning(
+                    "scale-pro api failed after %.1fs: %s",
+                    time.monotonic() - started_at, scale_error,
+                )
+                return None
 
     # ---- 三步协议（同去水印骨架，仅 path 不同）----
 

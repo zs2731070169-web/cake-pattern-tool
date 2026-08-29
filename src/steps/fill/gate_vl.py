@@ -22,6 +22,7 @@ import cv2
 import httpx
 import numpy as np
 
+from src.core.api_throttle import provider_slot
 from src.core.config import PatternToolSettings
 from src.core.http import get_http_client, http_sync
 
@@ -67,6 +68,12 @@ class CheckerboardGate:
     # ---- VL 通道（与 watermark.precheck 同协议）----
 
     def _ask_vl(self, image_bgr: np.ndarray, prompt: str) -> str | None:
+        # 并发闸（第三十八次修订）：单次 VL 问答（含 OSS 上传）整体排队——
+        # 入口双 VL 批内并行下 9 图×2 问=18 路并发，限流防 429
+        with provider_slot("dashscope", self._settings.dashscope_max_concurrent):
+            return self._ask_vl_cycle(image_bgr, prompt)
+
+    def _ask_vl_cycle(self, image_bgr: np.ndarray, prompt: str) -> str | None:
         try:
             oss_url = self._upload_image(image_bgr)
             response = http_sync(self._http.post(

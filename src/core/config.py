@@ -98,6 +98,12 @@ class PatternToolSettings(BaseSettings):
     scale_enabled: bool = False  # 是否启用超分外呼（关 = 放大记 failed 不交付）
     scale_timeout_seconds: int = 30  # 石榴超分预算（秒）；佐糖走 picwish_timeout_seconds
 
+    # ---- 第三方 API 并发闸（第三十八次修订——批内并行外呼 429 实锤；
+    #      任务周期粒度排队限流，core/api_throttle.provider_slot，0=不限）----
+    picwish_max_concurrent: int = 3  # 佐糖超分在途任务上限（9 图批实测 3 并发成功、第 4 个起 429）
+    dashscope_max_concurrent: int = 4  # 百炼并发上限（入口双 VL+水印预检+qwen-image 填充共用）
+    shiliu_max_concurrent: int = 2  # 石榴去水印在途任务上限
+
     # ---- 去水印段 2：qwen-vl 语义预检（4.4 v3 三段链路）----
     wm_precheck_enabled: bool = False  # OpenCV 零检出图走 VL 预检（判有才调佐糖）
     wm_precheck_key: str = ""  # DashScope API Key（qwen-vl-plus 文本计费，~¥0.003/次）
