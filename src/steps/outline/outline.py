@@ -1,11 +1,9 @@
-"""描边步：白底判定 → 图案分割（rembg alpha 蒙版，阈值法兜底）→ 外侧环带灰线。
+"""描边步：边界按段白度判定（第四十一次修订）→ 形状外环灰线（白段部分环）。
 
-技术方案 5.2 图 B 与图像处理方案 3.5 口径：
-- 白底（亮度+均匀性双判据，兼容拍摄白）才描边，非白底 skipped；
-- 图案分割首选 rembg U²-Net alpha 蒙版（深度显著性分割，毛发/浅色/细凸起
-  细节可用）；rembg 不可用/异常自动回退灰度自适应阈值法，描边不因此 failed；
-- 掩膜后处理与分割来源无关：碎屑过滤 → 轮廓平滑 → 图案外侧膨胀环带灰线
-  （零侵占图案本体；线宽 mm×DPI/25.4 物理恒定）。
+打印物理事实：食用墨水不印白墨——白背景段贴形状边界处零对比看不见（糯米纸
+裁剪无从下手），彩色段天然可见。判定单位因此不是整图而是**形状边界的每一段**：
+白段补灰线、彩段不画（第三十三次修订"看得见不加线"在段粒度继续成立）。
+纯白底=全环、纯彩底=零线（skipped）、混合底=部分环；stage 值仍 done/skipped。
 """
 
 from __future__ import annotations
@@ -31,11 +29,13 @@ class OutlineStepResult:
         self.stage_value = stage_value  # done / skipped
 
 
-# ---- 白底判定与图案掩膜阈值（亮度口径，兼容"拍摄白"） ----
+# ---- 白度阈值（亮度口径，兼容"拍摄白"） ----
 # 数码纯白 ~255；白纸拍摄受光影影响常见 236~248。硬阈值 ≥245 会把后者误判非白底
-WHITE_BG_MIN_MEDIAN_LUMA = 235  # 背景整体够亮：边缘亮度中位数下限
-WHITE_BG_UNIFORM_LUMA = 230  # 均匀性：亮度低于此值的边缘像素视为杂色/暗物
-WHITE_BG_UNIFORM_RATIO = 0.9  # ≥ 90% 边缘像素达均匀亮度才算白底
+WHITE_BG_MIN_MEDIAN_LUMA = 235  # 段白度判据：段内背景像素亮度中位数下限
+# 段判定常量（第四十一次修订）
+SEGMENT_MIN_COUNT = 16  # 边界分段数下限（周长再短也 ≥16 段，弧段粒度不过粗）
+SEGMENT_MAX_PX = 64  # 每段弧长上限（px）——段太长会把"大段白+小段彩"糊成一段
+SEGMENT_MIN_BG_SAMPLES = 50  # 段内背景样本绝对下限：不足按非白处理（确认白才画线）
 PATTERN_LUMA_MARGIN = 12  # 图案判定：比背景亮度低此值以上才算图案（容忍软阴影）
 PATTERN_LUMA_CLIP = (220, 245)  # 图案亮度阈值的裁剪区间（上限=数码纯白语义不放宽）
 MIN_PATTERN_AREA_RATIO = 0.05  # 连通块面积达主图案 5% 以上才描（碎屑过滤）
@@ -67,51 +67,11 @@ def edge_band_pixels(image_ndarray: np.ndarray) -> np.ndarray:
     return pixels[:, :3]  # 4 通道输入丢弃 alpha，只取颜色
 
 
-def is_white_background(image_bgra: np.ndarray) -> bool:
-    """第一闸（边缘带∩不透明）：亮度+均匀性双判据，兼容拍摄白。
-
-    透明区（形状裁剪外）不参与采样——裁剪白边不能再把灰底照片"洗白"。
-    不透明样本过少（<2% 图幅，形状裁剪常态）时放行，交给第二闸（环带复核）。
-    """
-    image_height, image_width = image_bgra.shape[:2]
-    band_height = max(2, image_height // 50)
-    band_width = max(2, image_width // 50)
-    opaque = opaque_mask(image_bgra)
-    band_opaque_flags = np.concatenate([
-        opaque[:band_height, :].reshape(-1),
-        opaque[-band_height:, :].reshape(-1),
-        opaque[:, :band_width].reshape(-1),
-        opaque[:, -band_width:].reshape(-1),
-    ])
-    # 边缘带大部分透明 = 形状裁剪常态（无背景页边可审），交第二闸环带复核裁决
-    if band_opaque_flags.mean() < 0.5:
-        return True
-    sampled = edge_band_pixels(image_bgra)[band_opaque_flags]
-    if sampled.shape[0] < 0.02 * image_height * image_width:
-        return True
-    edge_gray = cv2.cvtColor(sampled.reshape(-1, 1, 3), cv2.COLOR_BGR2GRAY).ravel()
-    median_luma = float(np.median(edge_gray))
-    uniform_ratio = float(np.mean(edge_gray >= WHITE_BG_UNIFORM_LUMA))
-    return median_luma >= WHITE_BG_MIN_MEDIAN_LUMA and uniform_ratio >= WHITE_BG_UNIFORM_RATIO
-
-
-def ring_background_is_white(image_bgra: np.ndarray, pattern_mask: np.ndarray) -> bool:
-    """第二闸（环带复核）：图案外扩 8–40px∩不透明 的背景是否够白。
-
-    拦"形状裁剪白边 + 灰底/彩底照片"类假白底：边缘带被裁剪白边占据，
-    但图案真实周边背景是灰/彩色的，不该描边。环带不透明样本不足时放行
-    （图案铺满图幅的常态，无背景可审）。
-    """
-    opaque = opaque_mask(image_bgra)
-    mask_bool = pattern_mask > 0  # 全程布尔——uint8 掩膜会被 numpy 当行号花式索引
-    inner = cv2.dilate(mask_bool.astype(np.uint8), np.ones((17, 17), np.uint8)) > 0  # 外扩 8px
-    outer = cv2.dilate(mask_bool.astype(np.uint8), np.ones((81, 81), np.uint8)) > 0  # 外扩 40px
-    ring = (outer & ~inner & ~mask_bool & opaque).astype(bool)
-    if np.count_nonzero(ring) < 0.02 * image_bgra.shape[0] * image_bgra.shape[1]:
-        return True
-    ring_pixels = image_bgra[ring][:, :3]
-    ring_gray = cv2.cvtColor(ring_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2GRAY).ravel()
-    return float(np.median(ring_gray)) >= WHITE_BG_MIN_MEDIAN_LUMA
+# （第四十一次修订退役）is_white_background / ring_background_is_white /
+# shape_inner_band_is_white / _band_background_pixels——整图"非黑即白"聚合
+# 裁决（median≥235 且 uniform≥0.9）对"白底但图案贴边"类图冤杀（pattern_3
+# 生产实锤 median=254 纯白、uniform=0.874<0.9 → skipped；rembg 对彩旗/
+# 飘带类细长贴边装饰分割覆盖率 0.0~0.2%，背景分离救不了）。git 历史可溯。
 
 
 # ---- rembg 分割会话（进程级懒加载单例；onnxruntime InferenceSession 并发安全） ----
@@ -366,9 +326,10 @@ def crop_shape_region_mask(shape_value: str, width: int, height: int) -> np.ndar
 
 def draw_shape_outline(
     image_ndarray: np.ndarray, shape_value: str, settings: PatternToolSettings,
-    width_mm: float | None = None,
+    width_mm: float | None = None, segment_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """沿形状边界**向外**画灰线（第三十二次修订：外边缘描边）。
+    """沿形状边界**向外**画灰线（第三十二次修订：外边缘描边；第四十一次
+    修订：segment_mask 非空时只画白段=部分环）。
 
     结构（外→内）：`alpha=0 透明区 │ 灰线环（线宽参数）│ 完整形状内容`——
     画布外扩一个线宽承接线环，线永不接触内容像素。旧内缩画法（形状最外
@@ -377,6 +338,13 @@ def draw_shape_outline(
     口径（mm×DPI/25.4）与灰度配置不变。3 通道直调输入返回白底合成 3 通道
     （线在透明区上，裸 3 通道会丢线）。形状外渗出清洗（第二十一次修订）
     随内缩画法一并退役——形状外区域本就被 alpha=0 收口，无可见渗出面。
+
+    segment_mask（画布坐标 bool 掩膜，white_segments_along_boundary 产出）：
+    只在其覆盖的边界段落线——混合底图的白段补线、彩段留空（部分环）。
+    None 时整环（纯白底全环语义）。掩膜搬运到外扩画布后先按线宽外扩再与
+    环带求交：白段采样圆贴画布边时环带落在原画布外的部分也有掩膜覆盖
+    （原画布边区的圆盘被裁掉一圈，不外扩会漏画）；彩段一像素不画也不动
+    alpha——"该段看得见，本就不需要线"。
     """
     was_3ch = image_ndarray.ndim == 3 and image_ndarray.shape[2] == 3
     image_bgra = ensure_bgra(image_ndarray)
@@ -396,8 +364,20 @@ def draw_shape_outline(
     dilated = cv2.dilate(mask_u8, dilate_kernel) > 0
     ring = dilated & (mask_u8 == 0)
 
-    # 线外全部透明（含矩形全幅照片原画布边区）；线环灰度整环覆盖落位
-    padded[:, :, 3] = np.where(dilated, padded[:, :, 3], 0)
+    if segment_mask is not None:
+        # 部分环：白段掩膜搬运到外扩画布并再外扩一个线宽（边界圆盘贴画布边
+        # 时环带在原画布外的部分仍被覆盖），与环带求交只白段落线
+        segment_padded = np.zeros(padded.shape[:2], np.uint8)
+        segment_padded[pad:pad + image_height, pad:pad + image_width] = (
+            segment_mask[:image_height, :image_width].astype(np.uint8)
+        )
+        segment_dilated = cv2.dilate(segment_padded, dilate_kernel) > 0
+        ring = ring & segment_dilated
+
+    # 线外全部透明（含矩形全幅照片原画布边区）；线环灰度整环覆盖落位。
+    # 部分环的收口沿落线段——彩段不画线也保持原样（"看得见不画"语义）
+    alpha_keep = dilated if segment_mask is None else (dilated & ~(segment_dilated & ~ring))
+    padded[:, :, 3] = np.where(alpha_keep | (mask_u8 > 0), padded[:, :, 3], 0)
     gray_value = settings.outline_gray_level
     padded[ring] = (gray_value, gray_value, gray_value, 255)
 
@@ -416,55 +396,90 @@ def _erode_zero_border(mask_u8: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     return cv2.erode(mask_u8, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0)
 
 
-def shape_inner_band_is_white(
-    image_bgra: np.ndarray, shape_value: str, settings: PatternToolSettings | None = None
-) -> bool:
-    """形状裁剪图的白底判定：边带内**背景像素**（剔除图案后）是否够白。
+def shape_boundary_band(
+    image_bgra: np.ndarray, shape_mask: np.ndarray, band_depth: int = 41
+) -> np.ndarray:
+    """形状边缘向内 band_depth px 的边带掩膜（bool）——按段白度采样的公共区域。"""
+    shrunk = _erode_zero_border(
+        shape_mask.astype(np.uint8), np.ones((2 * band_depth - 1,) * 2, np.uint8)
+    ) > 0
+    return shape_mask & ~shrunk & opaque_mask(image_bgra)
 
-    口径修正（2026-08-24）：白底判定看的是"背景"，不是"边带里图案占多少"——
-    图案贴形状边界（果冻类满幅图案）会把图案像素混进亮度统计误杀白底。
-    背景像素识别：优先 rembg 图案掩膜的补集；rembg 不可用时退"亮度离群剔除"
-    （边带亮度的高分位簇为背景）。灰底/彩底照片的背景像素整片暗，仍正确拒绝。
+
+def _shape_boundary_points(shape_mask: np.ndarray) -> list[tuple[int, int]]:
+    """形状掩膜边界像素序列（沿轮廓排序）——分段白度判定的采样骨架。
+
+    findContours 取最长轮廓（矩形类=画布边框轮廓；circle/heart/star=形状
+    外缘），重建后 CHAIN_APPROX_NONE 逐点保留弧线细节，不做折线近似。
+    """
+    contours, _ = cv2.findContours(
+        shape_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+    )
+    if not contours:
+        return []
+    return [tuple(int(v) for v in point[0]) for point in max(contours, key=cv2.contourArea)]
+
+
+def white_segments_along_boundary(
+    image_bgra: np.ndarray, shape_value: str, settings: PatternToolSettings | None = None
+) -> tuple[np.ndarray, int, int]:
+    """边界按段白度判定（第四十一次修订）：(白段掩膜, 白段数, 总段数)。
+
+    形状边界参数化等分 N 段（N=max(SEGMENT_MIN_COUNT, 周长/SEGMENT_MAX_PX)），
+    每段取边带∩不透明∩**背景**像素（背景=rembg 图案掩膜补集——细长贴边装饰
+    即使分割遗漏也只污染所在段的中位数，不再拖垮全图）算亮度中位数，
+    ≥WHITE_BG_MIN_MEDIAN_LUMA 记白段。段内背景样本 <SEGMENT_MIN_BG_SAMPLES
+    按非白处理——白段要求"确认白"，不是"没发现不白"（rembg 整体失效时段
+    样本即边带全量，判定退化为对图案贴边的裸统计，宁可不画）。
+
+    掩膜为段锚点采样圆的并集（画布坐标 bool）——段缘相邻圆相接保证连续；
+    采样只落在锚点 bounding box 内（3425² 大图不做全图网格运算）。
     """
     image_height, image_width = image_bgra.shape[:2]
     shape_mask = crop_shape_region_mask(shape_value, image_width, image_height)
-    shrunk = _erode_zero_border(shape_mask.astype(np.uint8), np.ones((81, 81), np.uint8)) > 0  # 内缩 40px
-    band = shape_mask & ~shrunk & opaque_mask(image_bgra)  # 形状边缘向内 0–40px 的带
-    if np.count_nonzero(band) < 0.02 * image_height * image_width:
-        return True
-    band_pixels = image_bgra[band][:, :3]
-    band_gray = cv2.cvtColor(band_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2GRAY).ravel()
+    band = shape_boundary_band(image_bgra, shape_mask)
+    boundary = _shape_boundary_points(shape_mask)
+    if not boundary:
+        return np.zeros((image_height, image_width), bool), 0, 0
 
-    background_gray = _band_background_pixels(band, band_gray, image_bgra, settings)
-    if background_gray is None or background_gray.size == 0:
-        return True  # 无法分离背景（极端图）：放行交画线，线断了也比漏描可接受
-    median_luma = float(np.median(background_gray))
-    uniform_ratio = float(np.mean(background_gray >= WHITE_BG_UNIFORM_LUMA))
-    return median_luma >= WHITE_BG_MIN_MEDIAN_LUMA and uniform_ratio >= WHITE_BG_UNIFORM_RATIO
-
-
-def _band_background_pixels(
-    band: np.ndarray,
-    band_gray: np.ndarray,
-    image_bgra: np.ndarray,
-    settings: PatternToolSettings | None,
-) -> np.ndarray | None:
-    """从边带亮度样本中分离背景像素（剔除图案）。
-
-    优先按 rembg 图案掩膜取补集采样；不可用时按亮度聚类近似——
-    边带亮度的上四分位簇视为背景（图案通常比白底暗）。
-    """
+    segment_count = max(SEGMENT_MIN_COUNT, len(boundary) // SEGMENT_MAX_PX)
+    background = np.ones_like(band)
     if settings is not None and settings.outline_matting_enabled:
         try:
-            pattern_mask = segment_pattern_mask(image_bgra, settings) > 0
-            background_band = band & ~pattern_mask
-            if np.count_nonzero(background_band) >= 0.01 * image_bgra.shape[0] * image_bgra.shape[1]:
-                pixels = image_bgra[background_band][:, :3]
-                return cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2GRAY).ravel()
-        except Exception:
-            pass
-    # 亮度聚类兜底：上四分位为背景簇
-    return band_gray[band_gray >= np.percentile(band_gray, 75)]
+            background = ~segment_pattern_mask(image_bgra, settings) > 0
+        except Exception as matting_error:
+            module_logger.warning("outline segment matting failed: %s", matting_error)
+
+    white_mask = np.zeros((image_height, image_width), bool)
+    white_count = 0
+    # 段采样半径：弧长一半（等分锚点间距/2）与边带深度取大——锚点间的边界
+    # 像素也要被最近段的采样圆覆盖，不留漏判缝隙
+    sample_radius = max(len(boundary) // segment_count // 2, 41)
+    for segment_index in range(segment_count):
+        anchors = [
+            boundary[(anchor_index * len(boundary)) // segment_count % len(boundary)]
+            for anchor_index in (segment_index, segment_index + 1)
+        ]
+        center_x = sum(x for x, _ in anchors) / len(anchors)
+        center_y = sum(y for _, y in anchors) / len(anchors)
+        left = max(0, int(center_x - sample_radius))
+        right = min(image_width, int(center_x + sample_radius) + 1)
+        top = max(0, int(center_y - sample_radius))
+        bottom = min(image_height, int(center_y + sample_radius) + 1)
+        if right <= left or bottom <= top:
+            continue
+        # ogrid 首轴是行（y）、次轴是列（x）——距离平方按 (row-cy)²+(col-cx)²
+        local_row, local_col = np.ogrid[top:bottom, left:right]
+        near = (local_row - center_y) ** 2 + (local_col - center_x) ** 2 <= sample_radius**2
+        samples = band[top:bottom, left:right] & near & background[top:bottom, left:right]
+        if np.count_nonzero(samples) < SEGMENT_MIN_BG_SAMPLES:
+            continue  # 样本不足=无法确认白，按非白段处理
+        segment_pixels = image_bgra[top:bottom, left:right][samples][:, :3]
+        gray = cv2.cvtColor(segment_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2GRAY).ravel()
+        if float(np.median(gray)) >= WHITE_BG_MIN_MEDIAN_LUMA:
+            white_count += 1
+            white_mask[top:bottom, left:right] |= near
+    return white_mask, white_count, segment_count
 
 
 class OutlineStep:
@@ -488,18 +503,28 @@ class OutlineStep:
         module_logger.info(
             "outline start: shape=%s size=%dx%d", shape_value, image_bgra.shape[1], image_bgra.shape[0]
         )
-        # 第三十三次修订：白底判定恢复（撤销三十二次的"无条件执行"）——判定门
-        # 的职责从来不是保护内容（外环画法线永不接触内容），而是"非白底图的
-        # 边界本来就看得见，外环是噪音"：灰底/照片背景不加线。线带净空判定
-        # （line_band_is_clear）维持退役——它管的"内容压线"在外环画法下不存在。
-        white_verdict = shape_inner_band_is_white(image_bgra, shape_value, self._settings)
-        if not white_verdict:
-            module_logger.info("outline → skipped (形状边带非白底)")
+        # 第四十一次修订：按段白度判定替代整图门——打印不印白墨，白段看不见
+        # 才需补线，彩段本来看得见不画。纯白=全环、混合=部分环（都记 done），
+        # 整圈非白=零线（skipped）。段粒度下 rembg 分割遗漏只污染所在段。
+        white_mask, white_count, segment_count = white_segments_along_boundary(
+            image_bgra, shape_value, self._settings
+        )
+        if segment_count > 0:
+            module_logger.info(
+                "outline segments: %d/%d 白段", white_count, segment_count
+            )
+        if white_count == 0:
+            module_logger.info("outline → skipped (边界全段非白：整圈看得见)")
             return OutlineStepResult(image_ndarray, "skipped")
+        partial = white_count < segment_count  # 全段白=全环；任一段非白=部分环
         # 第三十二次修订：外边缘描边（线环在形状外侧透明区上，永不接触内容）
-        outlined = draw_shape_outline(image_ndarray, shape_value, self._settings, width_mm)
+        outlined = draw_shape_outline(
+            image_ndarray, shape_value, self._settings, width_mm,
+            segment_mask=white_mask if partial else None,
+        )
         module_logger.info(
-            "outline → done(外环): 线宽=%dpx 灰度=%d%s",
+            "outline → done(%s): 线宽=%dpx 灰度=%d%s",
+            "部分环" if partial else "外环",
             outline_width_pixels(self._settings, width_mm), self._settings.outline_gray_level,
             f"（批级声明 {width_mm}mm）" if width_mm is not None else "",
         )

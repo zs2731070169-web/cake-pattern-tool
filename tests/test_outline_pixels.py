@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import cv2
 import numpy as np
@@ -182,8 +183,8 @@ def test_outline_matting_mask_light_pattern_kept(test_settings):
 
 
 def test_crop_shape_gray_background_skipped(api_client: TestClient):
-    """口径（第三十三次修订：白底判定恢复）：灰底照片裁圆不描边——非白底
-    边界本来就看得见，外环画法只改"怎么画"不改"画不画"。"""
+    """口径（第三十三次修订"非白底不加线"→第四十一次修订段粒度）：灰底
+    照片裁圆——整圈边界都看得见（全段非白），零线记 skipped。"""
     gray_canvas = np.full((400, 400, 3), 215, dtype=np.uint8)  # 灰底
     success, buffer = cv2.imencode(".png", gray_canvas)
     assert success
@@ -195,6 +196,79 @@ def test_crop_shape_gray_background_skipped(api_client: TestClient):
     assert response.status_code == 200
     job_status = wait_until_job_completed(api_client, response.json()["job_id"])
     assert job_status["images"][0]["stage_results"]["outline"] == "skipped"
+
+
+def test_mixed_background_partial_ring(api_client: TestClient):
+    """口径（第四十一次修订：按段判定替代整图非黑即白）：白底 + 顶部彩条
+    横贯（pattern_3 类贴边图案）——彩段不画线（图案自身即边界）、白段照画
+    （部分环），stage 仍记 done。整图门下该图 uniform 统计被彩条拉垮全图
+    skipped，白段裁剪无从下手是用户实锤。"""
+    mixed_canvas = np.full((400, 400, 3), 255, dtype=np.uint8)
+    mixed_canvas[0:100, :] = (60, 140, 200)  # 顶部 1/4 彩条（横贯整边）
+    success, buffer = cv2.imencode(".png", mixed_canvas)
+    assert success
+    response = api_client.post(
+        "/api/jobs",
+        files={"images": ("mixed.png", buffer.tobytes(), "image/png")},
+        data={"crop_meta": json.dumps({"1": {"shape": "circle", "box": {"width": 400, "height": 400}}})},
+    )
+    assert response.status_code == 200
+    job_status = wait_until_job_completed(api_client, response.json()["job_id"])
+    image_status = job_status["images"][0]
+    assert image_status["stage_results"]["outline"] == "done", "混合底白段应补线（部分环）"
+
+    download = api_client.get(image_status["result_url"])
+    result_bgra = cv2.imdecode(np.frombuffer(download.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    gray_line = np.all(np.abs(result_bgra[:, :, :3].astype(int) - 190) <= 10, axis=2) & (
+        result_bgra[:, :, 3] > 0
+    )
+    # 外扩 18px 后圆心 (218,218) r=200，环带中点 r≈209
+    def ring_gray(angle_deg: float) -> bool:
+        rad = math.radians(angle_deg)
+        y = int(218 + 209 * math.sin(rad))
+        x = int(218 + 209 * math.cos(rad))
+        return bool(gray_line[y, x])
+
+    # 顶部彩条正中（-90°）：图案贴边自身可见，不画线。彩条与圆边界斜交的
+    # 骑墙段（约 -150°/-30° 交界）允许画——彩条内多一段线无害，漏画才有害
+    assert not ring_gray(-90), "彩条段（-90°）不应画线"
+    # 左右下白段：白背景零对比看不见，必须补线
+    for angle in (180, 0, 90):
+        assert ring_gray(angle), f"白段（{angle}°）应画线"
+
+
+def test_pure_white_pattern_touching_edge_outlines_white_segments(api_client: TestClient):
+    """口径（第四十一次修订）：白底 + 图案贴满形状边带（rembg 分割遗漏场景
+    之外的常态）——贴边段按"段内背景中位数"判定：贴边图案把段样本占过半
+    时该段非白不画（图案自身即边界），白段照画。造图：左右两侧贴边深色竖
+    条 + 上下白背景，期望左右无线、上下有线。"""
+    canvas = np.full((400, 400, 3), 255, dtype=np.uint8)
+    canvas[:, 0:90] = (80, 60, 160)  # 左侧贴边竖条
+    canvas[:, 310:400] = (80, 60, 160)  # 右侧贴边竖条
+    success, buffer = cv2.imencode(".png", canvas)
+    assert success
+    response = api_client.post(
+        "/api/jobs",
+        files={"images": ("touch.png", buffer.tobytes(), "image/png")},
+        data={"crop_meta": json.dumps({"1": {"shape": "circle", "box": {"width": 400, "height": 400}}})},
+    )
+    assert response.status_code == 200
+    job_status = wait_until_job_completed(api_client, response.json()["job_id"])
+    image_status = job_status["images"][0]
+    assert image_status["stage_results"]["outline"] == "done"
+
+    download = api_client.get(image_status["result_url"])
+    result_bgra = cv2.imdecode(np.frombuffer(download.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    gray_line = np.all(np.abs(result_bgra[:, :, :3].astype(int) - 190) <= 10, axis=2) & (
+        result_bgra[:, :, 3] > 0
+    )
+    def ring_gray(angle_deg: float) -> bool:
+        rad = math.radians(angle_deg)
+        return bool(gray_line[int(218 + 209 * math.sin(rad)), int(218 + 209 * math.cos(rad))])
+    assert not ring_gray(180), "左贴边段不应画线"
+    assert not ring_gray(0), "右贴边段不应画线"
+    assert ring_gray(-90), "顶部白段应画线"
+    assert ring_gray(90), "底部白段应画线"
 
 
 def test_crop_shape_white_background_outlines_shape(api_client: TestClient):

@@ -17,3 +17,6 @@ __pycache__/
 
 # 反向代理脚本（内嵌 authtoken 密钥，绝不入库）
 proxy/
+
+# Claude Code 本地会话配置（个人权限缓存，不入库）
+.claude/settings.local.json
